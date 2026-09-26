@@ -460,6 +460,12 @@ class Renderer:
         encoder padding past `canvas_h`) are dropped from the display.
         """
         w = tile.width
+        if w > self._w:
+            # Stale frame from a wider canvas (decoded before a resize): wgpu
+            # rejects the overrun with a validation error, which is fatal.
+            log.debug("dropping %d-wide tile %d for %d-wide canvas",
+                      w, tile_index, self._w)
+            return
         origin_y = tile_index * slot_height
         remaining = max(0, self._h - origin_y)
         rows = min(tile.height, slot_height, remaining)
