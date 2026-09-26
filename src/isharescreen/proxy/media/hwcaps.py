@@ -23,13 +23,18 @@ import sys
 
 log = logging.getLogger(__name__)
 
-# A 64x64 HEVC Main 4:4:4 8-bit IDR access unit (VPS + SPS + PPS + IDR slice,
-# Annex-B), produced by libx265 from a yuv444p frame. Self-contained: it
-# decodes with a fresh decoder context, no external parameter sets. ~97 bytes.
+# A 256x256 HEVC Main 4:4:4 8-bit IDR access unit (VPS + SPS + PPS + IDR
+# slice, Annex-B), produced by libx265 from a flat yuv444p frame. Self-contained:
+# it decodes with a fresh decoder context, no external parameter sets. ~131
+# bytes. 256x256 rather than smaller because NVDEC (NVIDIA's decoder, behind
+# both the `cuda` hwaccel and nvidia-vaapi-driver's `vaapi`) rejects pictures
+# narrower than 144 px — a tinier sample fails the probe on GPUs that decode
+# the real stream fine.
 _HEVC444_SAMPLE = bytes.fromhex(
-    "0000000140010c01ffff0408000003009e280000030000baba0240000000014201"
-    "010408000003009e280000030000ba90041020b2dd25261734040000030004003d"
-    "090020000000014401c070306011200000012801ade0d117ffd39173238b80"
+    "0000000140010c01ffff0408000003009e2800000300003cba0240000000014201"
+    "010408000003009e2800000300003c9001010080b2dd49265780b4040000030004"
+    "000003006420000000014401c170306031200000012801af0b48579cb0fb12fff5"
+    "6bf82a93b8135e7c4d9c418fa96ce208f176b9809310067009c887000003038e"
 )
 
 # Per-platform hwaccel candidates to probe, in priority order — mirrors the
@@ -43,14 +48,27 @@ _PROBE_HWACCELS: dict[str, tuple[str, ...]] = {
 _cache: dict[str, bool] = {}
 
 
+def hwdevices_available() -> tuple[str, ...]:
+    """Hardware device types PyAV's FFmpeg was built with (e.g. ``vaapi``,
+    ``cuda``). Empty if PyAV is too old to report them or fails to load."""
+    try:
+        from av.codec.hwaccel import hwdevices_available as _available
+        return tuple(_available())
+    except Exception:
+        return ()
+
+
 def _probe_one(hwaccel_type: str) -> bool:
     """True iff `hwaccel_type` hardware-decodes the embedded HEVC 4:4:4 sample.
 
     Uses `allow_software_fallback=False` so libav will NOT silently decode in
     software when the GPU lacks the profile: a produced frame then means the
     GPU did it, while an unsupported profile yields no frame / an exception.
-    (Inspecting `frame.format` is unreliable — VideoToolbox hands back a normal
-    `nv24`/`nv12` frame even on a true hardware decode.)"""
+    (Inspecting `frame.format` is unreliable — PyAV downloads hardware frames
+    to system memory, so VAAPI/CUDA hand back plain `yuv444p` and VideoToolbox
+    a normal `nv24`/`nv12` frame even on a true hardware decode.) The fallback
+    switch only works on a context that actually attached the device, hence
+    the `is_hwaccel` check below."""
     try:
         import av
         from av.codec.hwaccel import HWAccel
@@ -64,6 +82,16 @@ def _probe_one(hwaccel_type: str) -> bool:
                      "assuming no HW 4:4:4", hwaccel_type)
             return False
         ctx = av.CodecContext.create("hevc", "r", hwaccel=hw)
+        # PyAV swallows "this FFmpeg build has no such hwaccel" (e.g. the
+        # PyPI wheel's bundled FFmpeg is built without VAAPI) and hands back a
+        # plain software context — where allow_software_fallback no longer
+        # applies, so the sample would decode in software and look like a
+        # HW success. Reject it up front.
+        if not getattr(ctx, "is_hwaccel", False):
+            log.info("hevc444 probe (%s): not supported by this FFmpeg build "
+                     "(available: %s)", hwaccel_type,
+                     ", ".join(hwdevices_available()) or "none")
+            return False
         frames = list(ctx.decode(av.Packet(_HEVC444_SAMPLE)))
         frames += list(ctx.decode(None))  # flush
         ok = bool(frames)
