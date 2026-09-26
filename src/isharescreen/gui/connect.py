@@ -528,7 +528,7 @@ _DASH = """<!doctype html><html><head><title>iShareScreen — Diagnostics</title
  function choose(c){ fetch('/action',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'action=session_choice&choice='+c}); document.getElementById('modal').classList.remove('show'); }
  const set = (id,v) => { const e=$(id); if(e) e.textContent = (v==null||v==='')?'—':v; };
  const upt = s => { s=Math.floor(s||0); const h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60; return (h?h+'h ':'')+(h||m?m+'m ':'')+x+'s'; };
- const qf = q => q ? `${q.depth}/${q.cap}` + (q.drop?` ⓧ${q.drop}`:'') : '—';
+ const qf = q => q ? `${q.depth}/${q.cap}` + (q.drop?` ⓧ${q.drop}`:'') + (q.resync?` ↻${q.resync}`:'') : '—';
  function tiles(ts){
    const host=$('tiles'); if(!ts||!ts.length){ host.innerHTML=''; return; }
    const maxf = Math.max(1, ...ts.map(t=>t.fps||0));

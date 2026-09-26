@@ -44,6 +44,10 @@ from typing import Callable, Optional
 # wgpu/render path. ~No overhead when unset.
 _NALU_DUMP_PATH = os.environ.get("ISS_NALU_DUMP")
 _nalu_dump_f = open(_NALU_DUMP_PATH, "wb") if _NALU_DUMP_PATH else None
+# Testing aid: ISS_DECODE_DELAY_MS=N sleeps N ms before each worker decode,
+# simulating a decoder that can't keep up (exercises the overload resync at
+# any resolution). Unset in normal use.
+_DECODE_DELAY_S = float(os.environ.get("ISS_DECODE_DELAY_MS", "0") or 0) / 1000.0
 
 import av
 
@@ -91,6 +95,17 @@ _PERTILE_RECOVERY = os.environ.get("ISS_PERTILE_RECOVERY", "1") != "0"
 
 # Decode-worker queue + lifecycle.
 _QUEUE_MAX = 512                           # NALUs in flight to the decoder
+# Overload resync. When decode can't keep up (e.g. HEVC 4:4:4 at 3840x2160+
+# on busy content), the queue used to fill and then drop NEW slices one at a
+# time. Every dropped slice breaks Apple's cross-tile reference chain, and
+# the recovery IDR then sat behind ~2 s of already-broken backlog — the
+# session stayed gray for good. Instead, once the backlog passes this mark
+# the worker throws the backlog away, holds every tile until a fresh
+# keyframe, and asks for one on all tiles: a short freeze, then a clean
+# picture. Half the queue is ~1 s of video at 4 tiles x 60 fps.
+_QUEUE_RESYNC_AT = _QUEUE_MAX // 2
+# Don't resync again before the requested keyframe has had time to land.
+_RESYNC_MIN_INTERVAL_S = 1.0
 _WORKER_DEQUEUE_TIMEOUT_S = 0.5
 _WORKER_JOIN_TIMEOUT_S = 2.0
 
@@ -247,6 +262,11 @@ class HevcDecoder:
         # on the calling thread instead of queueing.
         self._sync_decode_mode = False
         self._queue_full_drops: int = 0
+        # Overload resync (see `_QUEUE_RESYNC_AT`): armed by the feeder,
+        # performed by the worker (the queue's only consumer).
+        self._resync_pending = False
+        self._last_resync_t = 0.0
+        self._overload_resyncs: int = 0
 
         # PTS bookkeeping. Only the active decoder thread (sync mode = main
         # caller; async mode = worker) reads/writes these.
@@ -474,10 +494,14 @@ class HevcDecoder:
             return
         try:
             q.put_nowait((nalu, tile_idx))
+            if q.qsize() >= _QUEUE_RESYNC_AT:
+                self._resync_pending = True
         except queue.Full:
-            # Queue overflow — drop. DIAGNOSTIC: a dropped slice that a
+            # Queue overflow — drop, and resync (the high-water mark above
+            # normally fires first). DIAGNOSTIC: a dropped slice that a
             # later P-frame references (Apple uses refs ≤8 back) is a
             # silent wedge trigger, so count + surface it.
+            self._resync_pending = True
             self._queue_full_drops += 1
             n = self._queue_full_drops
             if n in (1, 10, 100, 1000) or n % 1000 == 0:
@@ -571,6 +595,11 @@ class HevcDecoder:
     @property
     def decode_queue_drops(self) -> int:
         return self._queue_full_drops
+
+    @property
+    def decode_queue_resyncs(self) -> int:
+        """Overload resyncs (backlog discarded, keyframe requested)."""
+        return self._overload_resyncs
 
     @property
     def good_counts(self) -> list[int]:
@@ -932,15 +961,49 @@ class HevcDecoder:
         worker reach the recovery IDR in ~1 RTT. Safe to empty here: this
         runs on the decode worker thread (via `_decode_one`), the queue's
         only consumer."""
+        broken: Optional[set[int]] = None
         if _PERTILE_RECOVERY:
             broken = {
                 ti for ti in range(len(self._tiles))
                 if self._gate._states[ti].bad_streak > 0
             }
-            if not broken:
-                broken = set(range(len(self._tiles)))
-            self._tiles_await_idr |= broken
-            for ti in broken:
+        self._await_keyframe(broken or None)
+        self._eagain_streak = 0
+        self._drain_queue()
+
+    def _overload_resync(self) -> bool:
+        """Discard the decode backlog and restart from a fresh keyframe on
+        all tiles (see `_QUEUE_RESYNC_AT`). Runs on the decode worker.
+        Returns False (and decodes on) if the last resync is too recent for
+        its keyframe to have landed."""
+        self._resync_pending = False
+        import time as _time
+        now = _time.monotonic()
+        if now - self._last_resync_t < _RESYNC_MIN_INTERVAL_S:
+            return False
+        self._last_resync_t = now
+        self._overload_resyncs += 1
+        dropped = self._drain_queue()
+        log.warning(
+            "decoder falling behind (%d slices queued, cap %d) — dropped the "
+            "backlog, holding all tiles for a fresh keyframe (resync #%d)",
+            dropped + 1, _QUEUE_MAX, self._overload_resyncs,
+        )
+        self._await_keyframe(None)
+        self._eagain_streak = 0
+        self._silent_nalus = 0
+        self._gate.force_keyframe_all()
+        return True
+
+    def _await_keyframe(self, tiles: Optional[set[int]]) -> None:
+        """Drop P-frames and hold output until the next IDR re-roots the
+        DPB: for `tiles` under ISS_PERTILE_RECOVERY (None = all tiles),
+        session-wide otherwise."""
+        if _PERTILE_RECOVERY:
+            if tiles is None:
+                tiles = set(range(len(self._tiles)))
+            self._tiles_await_idr |= tiles
+            for ti in tiles:
                 with self._tiles[ti].lock:
                     self._tiles[ti].saw_idr_since_reset = False
         else:
@@ -948,15 +1011,20 @@ class HevcDecoder:
             for slot in self._tiles:
                 with slot.lock:
                     slot.saw_idr_since_reset = False
-        self._eagain_streak = 0
+
+    def _drain_queue(self) -> int:
+        """Empty the worker queue; returns how many items were dropped.
+        Worker-thread only (the queue's sole consumer)."""
         q = self._queue
+        dropped = 0
         if q is not None:
-            n = q.qsize()
-            for _ in range(n):
+            for _ in range(q.qsize()):
                 try:
                     q.get_nowait()
                 except queue.Empty:
                     break
+                dropped += 1
+        return dropped
 
     def _drain_codec_to_slots(self) -> None:
         """Pull any frames libavcodec has buffered (None packet flush)."""
@@ -1012,7 +1080,12 @@ class HevcDecoder:
                 continue
             if item is None:
                 break
+            # The dequeued slice is part of the backlog being discarded.
+            if self._resync_pending and self._overload_resync():
+                continue
             nalu, tile_idx = item
+            if _DECODE_DELAY_S:
+                self._stop.wait(_DECODE_DELAY_S)
             try:
                 self._decode_one(nalu, tile_idx)
             except Exception as e:

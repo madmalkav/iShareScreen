@@ -3975,6 +3975,7 @@ class Session:
                     "depth": getattr(self._decoder, "decode_queue_depth", 0),
                     "cap": getattr(self._decoder, "decode_queue_cap", 512),
                     "drop": getattr(self._decoder, "decode_queue_drops", 0),
+                    "resync": getattr(self._decoder, "decode_queue_resyncs", 0),
                 } if self._decoder is not None else None,
             })
 
