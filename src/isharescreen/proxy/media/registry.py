@@ -264,6 +264,12 @@ def describe() -> str:
         plats = ",".join(s.platforms)
         rows.append(f"{s.name:<15} {s.codec:<5} {s.chroma:<6}  {plats:<10} "
                     f"{s.kind:<9} {s.priority:<4}  {avail:<9}  {s.note}")
+    # The libav decoders can only use hwaccels PyAV's own FFmpeg was built
+    # with — which is not necessarily what the system ffmpeg has.
+    from .hwcaps import hwdevices_available
+    rows.append("")
+    rows.append("hwaccel devices in PyAV's FFmpeg: "
+                + (", ".join(hwdevices_available()) or "none"))
     return "\n".join(rows)
 
 
