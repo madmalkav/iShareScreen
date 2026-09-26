@@ -92,6 +92,24 @@ def _qsv_hevc444() -> bool:
         return False
 
 
+def _warn_if_no_vaapi() -> None:
+    """VAAPI is the Linux HW decode path, but the PyPI PyAV wheel bundles an
+    FFmpeg built without it — installed drivers and a working system ffmpeg
+    don't help. Say so once, with the fix, instead of silently decoding in
+    software."""
+    try:
+        from av.codec.hwaccel import hwdevices_available
+        devices = list(hwdevices_available())
+    except Exception:
+        return            # PyAV too old to tell; the probe logs its own reason
+    if "vaapi" not in devices:
+        log.warning(
+            "PyAV's FFmpeg was built without VAAPI (has: %s), so VAAPI "
+            "hardware decode is unavailable. To enable it, rebuild PyAV "
+            "against the system FFmpeg: pip install --force-reinstall "
+            "--no-binary av av", ", ".join(devices) or "none")
+
+
 def hevc444_decode_method() -> "str | None":
     """How HEVC 4:4:4 can be hardware-decoded here: ``"qsv"`` (Intel Quick
     Sync), ``"libav"`` (generic libav hwaccel / native VideoToolbox), or
@@ -106,6 +124,8 @@ def hevc444_decode_method() -> "str | None":
     if sys.platform == "darwin":
         method = "libav"          # native VideoToolbox path (vtdecode.py)
     else:
+        if sys.platform.startswith("linux"):
+            _warn_if_no_vaapi()
         hwaccels = _PROBE_HWACCELS.get(sys.platform, _PROBE_HWACCELS["*"])
         if any(_probe_one(h) for h in hwaccels):
             method = "libav"

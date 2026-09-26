@@ -69,13 +69,33 @@ available.
    ```sh
    sudo apt install vainfo intel-media-va-driver-non-free
    ```
-   For AMD, swap the driver: `sudo apt install mesa-va-drivers`.
+   For AMD, swap the driver: `sudo apt install mesa-va-drivers`. NVIDIA
+   GPUs reach VAAPI through `nvidia-vaapi-driver`.
 3. Install iShareScreen (in a venv recommended):
    ```sh
    python3 -m venv ~/.venvs/iss
    ~/.venvs/iss/bin/pip install git+https://github.com/renegadelink/iShareScreen.git
    ~/.venvs/iss/bin/iss     # or symlink to ~/.local/bin
    ```
+
+**Hardware decode needs PyAV built against your system FFmpeg.** iss
+decodes through PyAV, and the prebuilt PyAV wheel from PyPI bundles its own
+FFmpeg that is built *without* VAAPI — so even with the drivers above and a
+system `ffmpeg -hwaccel vaapi` that works, iss decodes in software (it logs
+a warning saying so at startup). To use VAAPI, install with PyAV compiled
+from source instead:
+```sh
+sudo apt install pkg-config gcc python3-dev \
+    libavformat-dev libavcodec-dev libavdevice-dev libavutil-dev \
+    libavfilter-dev libswscale-dev libswresample-dev
+~/.venvs/iss/bin/pip install --no-binary av git+https://github.com/renegadelink/iShareScreen.git
+```
+(On an existing install: `~/.venvs/iss/bin/pip install --force-reinstall
+--no-binary av av`.) Arch-based distros ship the FFmpeg headers in the
+`ffmpeg` package itself. To check, this should list `vaapi`:
+```sh
+~/.venvs/iss/bin/python -c "from av.codec.hwaccel import hwdevices_available as h; print(h())"
+```
 
 For Fedora / Arch / openSUSE, translate the apt package names with your
 distro's package manager (most are named the same or very close).
