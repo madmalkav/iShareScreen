@@ -107,6 +107,46 @@ _QUEUE_RESYNC_AT = _QUEUE_MAX // 2
 # Don't resync again before the requested keyframe has had time to land.
 _RESYNC_MIN_INTERVAL_S = 1.0
 _WORKER_DEQUEUE_TIMEOUT_S = 0.5
+
+# Keep hardware-decoded frames on the GPU and download them lazily in
+# get_frame(). By default PyAV downloads every frame inside decode(), which
+# serialises "wait for the GPU to finish this picture" with "copy it back":
+# on NVIDIA (RTX 2080, real 3840x2160 4:4:4 content) that capped VAAPI at
+# ~38 fps and CUDA at ~54 fps, while the GPU itself decodes ~210-225 fps.
+# With frames kept on the GPU the worker never waits on a copy, and only the
+# frame the renderer actually picks up per tile is downloaded (superseded
+# frames never are): ~150 fps VAAPI / ~200 fps CUDA at ~0.6 CPU cores,
+# bit-identical output. Enabled where verified — CUDA, and VAAPI on NVIDIA's
+# nvidia-vaapi-driver. Other VA drivers (Intel iHD/i965, AMD radeonsi) keep
+# today's inline download until verified; ISS_HW_FRAMES_ON_GPU=1 opts them
+# in, =0 disables it everywhere.
+_HW_FRAMES_ON_GPU = os.environ.get("ISS_HW_FRAMES_ON_GPU", "")
+
+
+def _loaded_va_driver(maps_path: str = "/proc/self/maps") -> Optional[str]:
+    """Name of the VA-API driver loaded into this process (e.g. "nvidia",
+    "iHD", "radeonsi"), from /proc/self/maps; None if unknown."""
+    try:
+        with open(maps_path) as f:
+            for line in f:
+                name = line.rsplit("/", 1)[-1].strip()
+                if name.endswith("_drv_video.so"):
+                    return name[: -len("_drv_video.so")]
+    except OSError:
+        pass
+    return None
+
+
+def _keep_hw_frames_on_gpu(hw_type: str) -> bool:
+    """Whether to decode `hw_type` with frames kept on the GPU. Call after a
+    context for `hw_type` exists (so the VA driver is loaded)."""
+    if _HW_FRAMES_ON_GPU == "0":
+        return False
+    if hw_type == "cuda":
+        return True
+    if hw_type == "vaapi":
+        return _HW_FRAMES_ON_GPU == "1" or _loaded_va_driver() == "nvidia"
+    return False
 _WORKER_JOIN_TIMEOUT_S = 2.0
 
 # HW-accel fallback thresholds — empirical (Windows D3D11VA, Linux iGPU
@@ -1123,8 +1163,13 @@ class HevcDecoder:
         try:
             from av.codec.hwaccel import HWAccel
 
-            hw = HWAccel(device_type=hw_type)
-            c = av.CodecContext.create("hevc", "r", hwaccel=hw)
+            # Usually decidable up front: the startup probe has already
+            # loaded the VA driver. If not, the first context loads it and
+            # is replaced below.
+            on_gpu = _keep_hw_frames_on_gpu(hw_type)
+            c = (self._gpu_frames_context(hw_type) if on_gpu else None) or \
+                av.CodecContext.create("hevc", "r",
+                                       hwaccel=HWAccel(device_type=hw_type))
             # PyAV returns a plain software context (is_hwaccel False) when
             # its FFmpeg was built without this hwaccel — e.g. VAAPI in the
             # PyPI wheel. Installing it would label a software decoder
@@ -1133,6 +1178,8 @@ class HevcDecoder:
                 log.info("hwaccel %s unavailable: not in this FFmpeg build",
                          hw_type)
                 return None
+            if not on_gpu and _keep_hw_frames_on_gpu(hw_type):
+                c = self._gpu_frames_context(hw_type) or c
             c.extradata = extradata
             # SLICE threading (parallelise within a frame), all cores.
             # On Windows, DXVA2/D3D11VA cannot decode HEVC 4:4:4 (FFmpeg's
@@ -1153,6 +1200,24 @@ class HevcDecoder:
         except Exception as e:
             log.info("hwaccel %s unavailable: %s", hw_type, e)
             return None
+
+    @staticmethod
+    def _gpu_frames_context(
+        hw_type: str,
+    ) -> Optional[av.codec.context.CodecContext]:
+        """A context for `hw_type` whose frames stay on the GPU (see
+        `_HW_FRAMES_ON_GPU`); None if this PyAV can't do that."""
+        from av.codec.hwaccel import HWAccel
+        try:
+            hw = HWAccel(device_type=hw_type, is_hw_owned=True)
+        except TypeError:            # PyAV without is_hw_owned
+            return None
+        c = av.CodecContext.create("hevc", "r", hwaccel=hw)
+        if not getattr(c, "is_hwaccel", False):
+            return None
+        log.info("hwaccel %s: decoded frames stay on the GPU; downloaded "
+                 "on demand", hw_type)
+        return c
 
     def _make_sw_context(self, extradata: bytes) -> av.codec.context.CodecContext:
         # Single shared context, SLICE threading across all cores. SLICE
