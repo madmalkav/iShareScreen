@@ -24,10 +24,14 @@ class TileFrame:
       interleaved UV plane verbatim. Reserved for fast paths where the
       consumer wants to skip the deinterleave; not currently produced by
       the FFmpeg decoder (it always emits planar).
+
+    Plane data is any buffer: `bytes`, or a zero-copy `memoryview` onto a
+    decoded `av.VideoFrame` plane (the libav decoders). Consumers read it via
+    the buffer protocol (e.g. `np.frombuffer`) and must not write to it.
     """
-    y: bytes
-    u: bytes
-    v: bytes | None
+    y: bytes | memoryview
+    u: bytes | memoryview
+    v: bytes | memoryview | None
     width: int
     height: int
     y_stride: int
