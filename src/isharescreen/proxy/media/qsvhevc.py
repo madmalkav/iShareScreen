@@ -458,14 +458,15 @@ class QsvHevcDecoder:
                                        + 0.9 * self._decode_latency_ms)
         if not self._dpb_has_idr:
             self._dpb_has_idr = True
-        # Convert av.VideoFrame → TileFrame (pure Python bytes) while still
+        # Convert av.VideoFrame → TileFrame (pure Python bytes: copy=True) while still
         # inside _codec_lock (called from _decode_au which holds the lock).
         # QSV's surface pool cannot be reclaimed during a concurrent decode()
         # call while we hold the lock, so reading frame pixel data here is
         # safe. Storing a TileFrame (not av.VideoFrame) in the slot means the
         # render thread never touches a QSV surface, eliminating the
         # STATUS_ACCESS_VIOLATION in _av_frame_to_tile at get_frame() time.
-        tile_frame, had_err = _av_frame_to_tile(frame, self._reformatter, self._seen_fmts)
+        tile_frame, had_err = _av_frame_to_tile(
+            frame, self._reformatter, self._seen_fmts, copy=True)
         if tile_frame is None:
             return
         slot = self._tiles[ti]

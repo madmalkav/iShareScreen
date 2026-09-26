@@ -10,18 +10,14 @@ from __future__ import annotations
 
 
 def remove_emulation_prevention(data: bytes) -> bytes:
-    """Strip the `00 00 03` → `00 00` emulation-prevention transform from RBSP."""
-    out = bytearray()
-    i, n = 0, len(data)
-    while i < n:
-        if i + 2 < n and data[i] == 0 and data[i + 1] == 0 and data[i + 2] == 3:
-            out.append(0)
-            out.append(0)
-            i += 3
-        else:
-            out.append(data[i])
-            i += 1
-    return bytes(out)
+    """Strip the `00 00 03` → `00 00` emulation-prevention transform from RBSP.
+
+    `bytes.replace` scans left to right over non-overlapping matches — the
+    same semantics as the byte-wise loop this replaced, ~100x faster. That
+    matters: the HEVC decoder runs this on every slice (~240/s at 4 tiles x
+    60 fps), and the Python loop held the GIL for ~1 ms per slice, starving
+    the decode worker."""
+    return bytes(data).replace(b"\x00\x00\x03", b"\x00\x00")
 
 
 class BitReader:

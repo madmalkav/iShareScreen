@@ -126,6 +126,8 @@ def _av_frame_to_tile(
     frame: av.VideoFrame,
     reformatter_holder: list[Optional[av.video.reformatter.VideoReformatter]],
     seen_fmts: set[str],
+    *,
+    copy: bool = False,
 ) -> tuple[Optional[TileFrame], bool]:
     """Convert an `av.VideoFrame` to our `TileFrame`.
 
@@ -134,7 +136,10 @@ def _av_frame_to_tile(
     the cheapest signal we have for "the decoder concealed missing
     reference data". The tile is still returned (publish-it-anyway
     policy: a momentary visible artifact + a fast FIR is more useful
-    to the operator than a frozen tile)."""
+    to the operator than a frozen tile).
+
+    Planes are zero-copy views unless `copy=True` (see below); QSV passes
+    `copy=True` so its surfaces are never touched outside its codec lock."""
     err = getattr(frame, "decode_error_flags", 0)
     flg = getattr(frame, "flags", 0)
     had_error = bool(err) or bool(flg & 0x01)
@@ -184,10 +189,18 @@ def _av_frame_to_tile(
         width = frame.width
         height = frame.height
 
+    # Planes are handed over as zero-copy memoryviews. Copying them with
+    # bytes() cost ~2 ms per 3840x544 4:4:4 tile under decode load (6 MB,
+    # GIL held) and capped the whole pipeline near 60 fps; the views make
+    # get_frame ~0.03 ms. Safe: a memoryview keeps its av plane, and thus
+    # the refcounted AVFrame buffer, alive — libav never reuses a buffer
+    # that is still referenced (verified for software and VAAPI decode).
+    buf = bytes if copy else memoryview
+
     if fmt in ("yuv420p", "yuvj420p"):
         yp, up, vp = frame.planes
         return TileFrame(
-            y=bytes(yp), u=bytes(up), v=bytes(vp),
+            y=buf(yp), u=buf(up), v=buf(vp),
             width=width, height=height,
             y_stride=yp.line_size,
             uv_stride=up.line_size,
@@ -198,7 +211,7 @@ def _av_frame_to_tile(
     if fmt in ("yuv444p", "yuvj444p"):
         yp, up, vp = frame.planes
         return TileFrame(
-            y=bytes(yp), u=bytes(up), v=bytes(vp),
+            y=buf(yp), u=buf(up), v=buf(vp),
             width=width, height=height,
             y_stride=yp.line_size,
             uv_stride=up.line_size,
