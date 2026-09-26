@@ -317,6 +317,12 @@ class AvcDecoder:
             from av.codec.hwaccel import HWAccel
             hw = HWAccel(device_type=hw_type)
             c = av.CodecContext.create("h264", "r", hwaccel=hw)
+            # A software context comes back (is_hwaccel False) when PyAV's
+            # FFmpeg lacks this hwaccel; don't label it as hardware.
+            if not getattr(c, "is_hwaccel", False):
+                log.info("AVC hwaccel %s unavailable: not in this FFmpeg build",
+                         hw_type)
+                return None
             c.extradata = extradata
             c.flags = _CODEC_FLAG_LOW_DELAY
             c.flags2 = _CODEC_FLAG2_FAST

@@ -1033,6 +1033,14 @@ class HevcDecoder:
 
             hw = HWAccel(device_type=hw_type)
             c = av.CodecContext.create("hevc", "r", hwaccel=hw)
+            # PyAV returns a plain software context (is_hwaccel False) when
+            # its FFmpeg was built without this hwaccel — e.g. VAAPI in the
+            # PyPI wheel. Installing it would label a software decoder
+            # "vaapi" and stop us trying the next candidate (cuda).
+            if not getattr(c, "is_hwaccel", False):
+                log.info("hwaccel %s unavailable: not in this FFmpeg build",
+                         hw_type)
+                return None
             c.extradata = extradata
             # SLICE threading (parallelise within a frame), all cores.
             # On Windows, DXVA2/D3D11VA cannot decode HEVC 4:4:4 (FFmpeg's
