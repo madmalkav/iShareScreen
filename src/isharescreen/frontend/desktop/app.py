@@ -17,11 +17,11 @@ from typing import Optional
 
 import glfw
 import wgpu
-from rendercanvas.glfw import RenderCanvas
 
 from ...proxy.protocol.negotiation import AdvertiseDims
 from ...proxy.session import Session, SessionConfig
 from .audio_sink import make_audio_sink
+from .canvas import WaylandSafeCanvas
 from .gpu import Renderer
 from .keymap import GLFW_KEY_TO_X11, glfw_button_to_rfb_bit
 
@@ -368,7 +368,7 @@ def run(
     adv = config.advertise
     win_w = (adv.width if adv else 0) or scaled_w or canvas_w
     win_h = (adv.height if adv else 0) or scaled_h or canvas_h
-    window = RenderCanvas(title=title, size=(win_w, win_h), max_fps=120)
+    window = WaylandSafeCanvas(title=title, size=(win_w, win_h), max_fps=120)
     glfw_window = window._window  # for raw glfw input callbacks only
     # Lock the window to the content's aspect ratio so the stream always fills
     # it edge-to-edge with no letterbox side-bars (restores pre-merge behavior;
@@ -745,7 +745,7 @@ def run(
         base = min(rw0, 1280) or 1280
         win_w2 = max(1, base)
         win_h2 = max(1, int(base * rh0 / rw0)) if rw0 else base
-        w2 = RenderCanvas(title=title_s, size=(win_w2, win_h2), max_fps=120)
+        w2 = WaylandSafeCanvas(title=title_s, size=(win_w2, win_h2), max_fps=120)
         gw2 = w2._window
         try:
             glfw.set_window_aspect_ratio(gw2, rw0, rh0)
