@@ -77,6 +77,15 @@ def _even(n: int) -> int:
     return n - (n & 1)
 
 
+def _is_stale_tile(tile, canvas_w: int) -> bool:
+    """True for a tile wider than the current canvas — a frame decoded from
+    the previous stream that was still in its slot when a resize shrank the
+    canvas. Narrower tiles are legitimate (the host can fall back to a smaller
+    resolution than advertised; the renderer letterboxes them), wider ones
+    can't come from the new stream."""
+    return tile.width > canvas_w
+
+
 def _auto_advertise_dims() -> tuple[int, int]:
     """Initial virtual-display size when no fixed --advertise was given:
     ~85% of the primary monitor's work area (its usable region, minus
@@ -1391,6 +1400,12 @@ def run(
         for ti in range(num_tiles):
             tf = session.get_frame(ti)
             if tf is None:
+                continue
+            # A leftover from before a canvas shrink must neither be drawn
+            # (it overruns the new textures) nor resolve slot_h below.
+            if _is_stale_tile(tf, canvas_w):
+                log.debug("skipping stale %d-wide tile %d for %d-wide canvas",
+                          tf.width, ti, canvas_w)
                 continue
             first_seen[ti] = True
             # Refine slot_h on the first tile — encoder's CTU-padded
