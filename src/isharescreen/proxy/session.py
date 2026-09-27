@@ -3036,6 +3036,11 @@ class Session:
         # consider another adoption.
         self._last_publish_t = now
         if self._decoder is not None:
+            # New stream: don't show its not-yet-rooted tiles as gray
+            # (HEVC startup hold; restart() re-arms it too).
+            rearm = getattr(self._decoder, "rearm_startup_hold", None)
+            if callable(rearm):
+                rearm()
             # If a dynamic resolution change is in flight, defer the
             # decoder restart until the video process loop harvests
             # fresh VPS/SPS/PPS from the new encoder's burst. The old

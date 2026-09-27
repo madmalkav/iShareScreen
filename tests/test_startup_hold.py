@@ -70,3 +70,12 @@ def test_rebuild_rearms_the_hold(dec, monkeypatch):
     dec._gate.mark_decode_error(0)
     dec.publish(0)
     assert dec.get_frame(0) is None
+
+
+def test_ssrc_adoption_rearms_the_hold_without_rebuild(dec):
+    dec.publish(0)
+    assert dec.get_frame(0) is not None        # shown after the build
+    dec.rearm_startup_hold()                   # host switched SSRC group
+    dec._gate.mark_decode_error(0)
+    dec.publish(0)
+    assert dec.get_frame(0) is None            # held (keeps last picture)

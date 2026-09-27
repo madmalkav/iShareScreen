@@ -630,6 +630,14 @@ class HevcDecoder:
         self.__dict__.setdefault("_tiles_shown", set()).add(tile_idx)
         return tile_frame
 
+    def rearm_startup_hold(self) -> None:
+        """Re-arm the startup hold when the session adopts a new SSRC group
+        without rebuilding the decoder (the host's switch ~2 s into every
+        session comes too soon after the build for a restart)."""
+        import time as _time
+        self._codec_built_t = _time.monotonic()
+        self._tiles_shown = set()
+
     def _startup_hold(self, tile_idx: int) -> bool:
         """True while a tile that hasn't been shown since the decoder was
         (re)built still needs a keyframe (see `_STARTUP_HOLD_S`)."""
