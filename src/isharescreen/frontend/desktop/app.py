@@ -380,6 +380,9 @@ def run(
     # host resize); fit_window_to_screen below also subtracts the frame where
     # GLFW only knows it once the window exists (Windows/macOS/X11).
     open_w, open_h = fit_size((win_w, win_h), usable_screen_area())
+    if (open_w, open_h) != (win_w, win_h):
+        log.info("window %dx%d does not fit the usable screen area; opening at "
+                 "%dx%d (video is scaled to fit)", win_w, win_h, open_w, open_h)
     window = WaylandSafeCanvas(title=title, size=(open_w, open_h), max_fps=120)
     glfw_window = window._window  # for raw glfw input callbacks only
     # Lock the window to the content's aspect ratio so the stream always fills
