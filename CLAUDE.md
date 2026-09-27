@@ -1,8 +1,9 @@
 # CLAUDE.md
 
 Python client for macOS Screen Sharing **High Performance** mode: RFB 003.889 control over TCP, HEVC 4:4:4 (or H.264 4:2:0)
-video + AAC-ELD audio over SRTP/UDP, rendered with wgpu. The protocol reference is `docs/apple_vnc_rfc.md`; the user-facing codec
-and decoder guide is the README's "Codecs and decoders" section.
+video + AAC-ELD audio over SRTP/UDP, rendered with wgpu. The protocol reference is `docs/apple_vnc_rfc.md` (media transport §10,
+rate control §10.8.1, liveness §10.8.2; facts from the remotex notes are marked [REMOTEX]); the user-facing codec and decoder
+guide is the README's "Codecs and decoders" section.
 
 ## Layout
 - `proxy/session.py`: the session core. Handshake + start burst, UDP drain/process threads, RTCP (RR, FIR/PLI, NACK, LTR ack,
@@ -110,11 +111,16 @@ offline replay), `ISS_DECODE_DELAY_MS` (simulate a slow decoder).
    the bits per picture.
 2. **`--refresh-rate 60|30` option:** a proven decode-cost lever (−44 % software CPU, same per-picture quality); not built.
    Could let weak/Intel viewers keep HEVC 4:4:4 at 30 fps instead of H.264.
-3. **Host switching to its physical display** (on local login or long idle) during a curtain session: a local branch
-   re-requests the virtual display after an unrequested switch; it needs live confirmation before merging. A related local
-   branch holds tiles at decoder start until a keyframe (startup gray).
+3. **Host switching to its physical display** (on local login or long idle) during a curtain session. Branch
+   `fix/return-to-virtual-display` (pushed, not merged) re-requests the virtual display after an unrequested switch; it needs
+   live confirmation (a local login or long idle during a session) before merging. Branch `fix/hide-startup-gray` (pushed,
+   not merged) holds tiles at decoder start until a keyframe; since #21 startups are mostly clean, so check whether it's still
+   needed. The layout's session-state word ([REMOTEX] reading, rfc §8.4) may be a better trigger than inferring the switch.
 4. **Software decode cost after RCTL:** at ~56 Mbit/s, 4K60 HEVC software decode needs ~6 cores. Weak CPUs rely on the
    delay feedback to make the host back off; not measured on a weak machine.
 5. **Host rate-control inputs not sent:** RCTL's second byte (meaning unknown) and loss/BWE fields are sent as 0/60000.
    Loss reporting might matter on lossy links; untested.
 6. **ProRes:** revisit only if a way to request it becomes known (see above).
+7. **`AutoFrameBufferUpdate` (`0x09`) body:** static analysis reads a `selected_screen` word where [REMOTEX] measured a push
+   interval in µs (rfc §8.11). iss arms nothing and polls 1×1 every tx tick, which keeps cursor shapes flowing; resolve before
+   relying on `0x09`.
