@@ -418,9 +418,13 @@ Each entry is 28 bytes (`0x1c`), big-endian:
 
 `width`/`height` are the source render resolution; `scaled_width`/`scaled_height` the logical resolution presented to the viewer. `refresh_rate_hz` is a big-endian IEEE-754 double (observed `60.0` = `40 4e 00 00 00 00 00 00`). `flags` bit `0` = HDR; higher bits are a **revision gap** (observed `0`). `HandleSetDisplayConfiguration` tests only bit 0 of the `+0x18` mode-entry flags (sets the per-display HDR flag); the rest is stored but unused. The separate "do not adjust refresh rate" bit is bit 1 of the **message-header** flags byte, not this mode-entry word.
 
+**Refresh rate vs. encode rate.** The host accepts any `refresh_rate_hz` for a virtual display. With 30, 60, 90 and 120 the host logged `viewer set refreshRate <value>`, but its media encoder stayed at `encode frame rate 60` (stream configuration `vcMediaStreamFramerate = 60`) in every case. A picture is sent at most once per display refresh and at most 60 times a second. So 30 Hz yields 30 pictures/s (half the decode cost, similar bits per picture), and 90/120 Hz yield no more than 60. What sets the 60 fps encode rate is a **revision gap**. *(Verified by an interoperable client against a macOS 27.2 host; the 30 Hz behaviour matches [REMOTEX].)*
+
 ### 7.3 Dynamic Resolution Behavior
 
 A viewer that wants in-band mid-session resize MUST send a **full dynamic descriptor** on its `0x1d`: `display_flags` bit `0x01` set, `display_type = 4`, `reserved = 7`, `current_mode_index`/`preferred_mode_index` valid (`< mode_count`), `max_width`/`max_height` bounding the backing geometry, and a populated mode table. A descriptor that omits the dynamic flag is treated as an ordinary (non-resizable) display configuration — sending a bare 0x1d mid-session does not initiate a resize. Native Screen Sharing.app emits this full descriptor on **every** 0x1d (initial and steady-state); a viewer that only needs a fixed-resolution session, however, MAY send a **non-dynamic** descriptor — the reference client (iShareScreen) emits a bare descriptor (no dynamic flag, `display_type = 0`, zeroed mode indices) for static sessions and interoperates fully. The full dynamic descriptor is required only to *request* an in-band resize. The server later confirms each change via `AppleDisplayLayout` (§7.5, §8.4), which carries the authoritative `scaled`/`backing` geometry and MAY differ from (e.g. be smaller than) the request when it exceeds the host's backing cap. The full media-mode exchange the dynamic flag drives is specified in §10.9. This is confirmed against a native resize capture and reproduced by an interoperable client.
+
+**Resize and pending reads.** A client SHOULD NOT have a full-framebuffer read outstanding when it shrinks the display: [REMOTEX] reports that serving a pixel read sized for the old display after it shrank crashes `ScreensharingAgent` (the session loses its virtual display, often its connection), and that update arming counts as such a read. After a `0x1d`, re-arm with a 1×1 incremental `FramebufferUpdateRequest` rather than a full-screen non-incremental one. An interoperable client doing so completed shrink/grow sequences with no host crash (the crash did not reproduce with either request on its test host). A client SHOULD also not send a display change while a `0x1c` offer is unanswered (§10.3).
 
 ### 7.4 SetDisplayMessage (`0x0d`)
 
@@ -506,6 +510,7 @@ display_record[n_displays]   -- 0x38 (56) bytes each:
 The leading `scaled_w/h`, `backing_w/h` are the first record's bounds rects; the two `3ff0000000000000` doubles in the live sample are the **scale factors (1.0)**, not refresh-Hz. The record body model comes from the sender. There is a minor offset discrepancy between the a recent macOS build disassembly and the live-host bytes near the geometry leader (likely version skew) — treat the live `0x451` geometry as authoritative and the record body as the field model.
 - **Media-path obligation.** When this message arrives mid-session **on the media (HEVC) path** as the answer to a viewer-initiated resolution change (§10.9), framebuffer sizing is **not sufficient** — the viewer MUST follow it with a `MediaStreamOptions` (`0x1c`) re-offer to make the server resize the encoder canvas. A viewer that resizes its local framebuffer but never re-offers will see the media stream stall (the server emits the `0x451` and then stops sending media). On the pure framebuffer path this message is purely a sizing action with no re-offer.
 - **Cursor re-arm obligation.** Independently of the media re-offer above — and on **every** `0x451`, including no-geometry-change layout events emitted at a login/lock/agent transition — a client MUST re-arm the server's framebuffer sender by re-sending `AutoFrameBufferUpdate` (`0x09`, §8.11) + a non-incremental `FramebufferUpdateRequest` (`0x03`). Without this the server stops emitting cursor (`0x450`) SELECTs after the transition and the cursor shape freezes on its last value (§8.3, §8.11). Unlike the media re-offer, the re-arm fires on every layout, not only on a geometry change.
+- **Independent reading ([REMOTEX]).** From live measurement, [REMOTEX] reads the header after the `u16` prefix as: `+0x00 u16 version (5)`, `+0x02 u16×2` desktop size in points, `+0x06 u16×2` framebuffer size in pixels, `+0x0a u32` screen being sent (`0xffffffff` = all), `+0x0e u32` **session state** (on console, obscured, locked, login pending), `+0x12 u16` display count (1–25). It reads each 0x38-byte record's first `f64` as the screen's **native density** (1.0/2.0; 0.0 if the host could not look the mode up), the second as the applied server-side scale, and record flags bit 2 as **dynamic virtual display**; bounds are given as edges `(top, left, bottom, right)`. It also notes a layout arrives at every login, lock and user switch. Where this differs from the sender-derived model above, the live geometry is authoritative; the session-state word is a candidate signal for login/lock transitions.
 - **Unknown fields**: receiver MUST tolerate and ignore trailing fields it does not interpret.
 
 ### 8.5 VendorKeysymEncoding (`0x453`)
@@ -645,7 +650,9 @@ u16   w
 u16   h
 ```
 
-Switches the server to server-driven framebuffer streaming. `HandleAutoFrameBufferUpdateMessage`: `version` is the incremental/update flag; `selected_screen` is the target screen id, with `0xffffffff` as the sentinel for "all/main displays" (it clears the per-screen-selection bool). After sending this, a client SHOULD NOT continue to poll with `FramebufferUpdateRequest`. The region `x,y,w,h` may be the **logical** geometry (observed from native) or the **backing** geometry (an interoperable client sends backing); the daemon accepts either.
+Switches the server to server-driven framebuffer streaming.
+
+> **Conflicting reading of the `u32`.** [REMOTEX] measured this word as a push **interval in microseconds**: with `0` the host pushes updates as fast as it captures a changing screen (60–90 updates/s, 15–33 MB/s of zlib for a playing video at 1920×1080); with `1000000` it pushes about one update per second. A still screen gets nothing unrequested either way. The static-analysis reading below (`selected_screen`, `0xffffffff` = all) and the measured one disagree; treat the field's meaning as a **revision gap**. Either way, unpaced pushes are costly: the host reads no client messages while it writes an update, so a client that drains slowly has its input left unread for as long as the screen changes ([REMOTEX]: 35–104 s). A media-path client SHOULD keep the armed/polled region minimal (a 1×1 region still brings every cursor shape and layout). `HandleAutoFrameBufferUpdateMessage`: `version` is the incremental/update flag; `selected_screen` is the target screen id, with `0xffffffff` as the sentinel for "all/main displays" (it clears the per-screen-selection bool). After sending this, a client SHOULD NOT continue to poll with `FramebufferUpdateRequest`. The region `x,y,w,h` may be the **logical** geometry (observed from native) or the **backing** geometry (an interoperable client sends backing); the daemon accepts either.
 
 - **Cursor / pseudo-encoding arming.** Arming the framebuffer sender is also what keeps the server emitting the TCP-side cursor pseudo-encoding (`0x450` STORE/SELECT, §8.3) and the other server-driven control rects. Native Screen Sharing.app sends `0x09` at session start (paired with a non-incremental `FramebufferUpdateRequest`, §8.2) and **re-sends the same pair at every `AppleDisplayLayout` (`0x451`, §8.4)**. The arming is dropped across a display/session transition (login, lock, fast-user-switch agent handoff), so a client that does not re-arm at each `0x451` will see cursor SELECTs stop and the shape freeze. **A client MUST re-send `0x09` + a non-incremental `0x03` on every `0x451`** to keep cursor (and other server-driven pseudo-encoding) updates flowing. This re-arm pair is lightweight and **independent of** the §10.9 media re-offer (`0x1c`): the media re-offer is required only when the layout reflects an actual geometry change, whereas the cursor re-arm is required on **every** `0x451`, including no-change layout events. *(Confirmed against a native capture and an interoperable client: the post-login cursor freeze reproduces without the re-arm and is resolved by it.)*
 
@@ -759,6 +766,9 @@ The switch to compressed media is gated on completion of the `0x1c` MediaStreamO
        46B  video2 key1 ; 46B video2 key2 ; video2_offer (video2_offer_len bytes; present only if non-zero)
 ```
 
+- **Answer framing ([REMOTEX]).** The host answers with rectangles of encoding `0x3f2`, each a `u16` size and one of: **message 1** (36-byte body: `u16` type, `u16` version, `u32` flags, then a `u16` UDP port + `u32` flags for audio at `+8/+10`, video 1 at `+14/+16`, video 2 at `+20/+22`, 10 reserved bytes; bit 0 enables a leg; ports observed 5900/5901, and the viewer receives on the same numbers); **message 2** (AVConference's answer: the common 8-byte header, `u16` lengths of the audio, video 1 and video 2 answer blobs, a zero `u32`, the blobs); **message 3** (16-byte error: the header, `u32` type, `u32` sub-code). An empty audio or video offer is refused (error type 2).
+- **Degenerate first answer and re-offers.** The first answer often carries no encoder canvas yet (zero width/height in the video answer). An interoperable client re-sends the identical offer every 0.2 s until an answer carries a canvas (typically 1–7 re-sends). Each re-sent offer makes the host start a stream with new SSRCs and tear it down ~100 ms later, so short-lived SSRC groups precede the live one on the video port. A receiver MUST pick the group that is **still sending**, not the first or lowest-numbered complete group. Waiting instead for the host's own follow-up answer works in some sessions but not reliably, and the stream is then already running when the answer arrives.
+- **One offer at a time ([REMOTEX]).** A second `0x1c` sent while the first one's capture was still starting left the capture failed (`didStart: 0 error: 32000`); when that virtual display was later deallocated, WindowServer aborted and logged the console user out. [REMOTEX] also reports the answer sometimes arrives twice for one offer. The re-send behaviour above has not reproduced this failure, but a client SHOULD NOT send a display change while an offer is unanswered.
 - **Offer/answer state**: client sends `0x1c` offer → server returns `0x1c` answer → media transport begins. The per-stream `*_offer` blobs are opaque to the screen-sharing code (passed to AVConference's `AVCMediaStreamNegotiator`); the **video** offer internals and the full answer layout remain a **revision gap**. (The `u32` at +0x06 is the `flags` field above, not an unknown word; the `u32` at +0x10 is reserved/zero in every captured offer.)
 
 - **`audio_offer` blob — requested audio bitrate (field 4).** The audio offer is a zlib-compressed protobuf `MediaBlob` (negotiator mode 8). Its audio media-description sub-message carries the viewer's **requested audio bitrate** in field 4 — Apple's `preferredMediaBitRate`. AVConference parses it into the negotiated `AVCAudioStreamConfig` (`-[AVCMediaStreamNegotiator setupAudioStreamConfiguration:]`) and passes it to `-[VCAudioTierPicker tierForAudioBitrate:]`, which selects an AAC-ELD tier; the server's own default for this stream type is `320000`. Native Screen Sharing offers `24191` (≈24 kbps). For screen-share system audio there is effectively **one** tier (~21 kbps on the wire), so any value above the tier floor yields the same rate — **field 4 is a tier selector, not a proportional rate**. A value **below the lowest tier's floor** (empirically ~5 kbps) makes the picker find *no corresponding tier* and the server transmits **no audio** (only the rtcp-muxed keepalive remains, ~0.4 kbps). This is the sole client-side means to suppress audio: the audio section is **mandatory** (an empty `audio_offer` makes the answer degenerate and no media burst arrives), and screen-share system audio negotiates no direction/enable field. A viewer wanting video-only therefore requests a sub-floor field-4 value rather than omitting the stream.
@@ -770,7 +780,9 @@ Two UDP flows relative to the control port `P` (default 5900):
 - **`P+1` (5901): video** — RTP payload type `100` (HEVC), with the video stream's RTCP multiplexed on the same port;
 - **`P` (5900): audio** — RTP payload type `101` (AAC-ELD-SBR), with the audio stream's RTCP multiplexed on the same port.
 
-RTCP is rtcp-muxed onto each media port alongside that port's RTP; there is no separate RTCP port. RTCP (PT 200–207) is seen on both 5901 and 5900. Video is delivered as **four RTP streams** on four consecutive SSRCs, each a horizontal tile (§10.7). Each SSRC has an independent sequence space; receivers MUST track the SRTP rollover counter (ROC) **per SSRC**.
+RTCP is rtcp-muxed onto each media port alongside that port's RTP; there is no separate RTCP port. RTCP (PT 200–207) is seen on both 5901 and 5900. **Demultiplexing** follows RFC 5761 §4: a packet whose second byte is in 192–223 is RTCP. That byte MUST NOT be masked with `0x7f` first (an RTP check); doing so maps SR `200` to `72` and misclassifies every RTCP packet as media. The host sends a Sender Report on **each** leg about once a second, with or without media.
+
+RTP packets carry a one-word header extension under profile `0x9311` or `0x9301` holding the picture's packet count and a frame counter ([REMOTEX]; not needed for decoding). The marker bit ends a picture. The host sends each picture as one burst at link speed: a receive buffer of Linux's default ~208 KB loses datagrams (including keyframe fragments) at high resolutions, and a ~4 MB buffer avoids it ([REMOTEX]; an interoperable client uses 4 MB). Video is delivered as **four RTP streams** on four consecutive SSRCs, each a horizontal tile (§10.7). Each SSRC has an independent sequence space; receivers MUST track the SRTP rollover counter (ROC) **per SSRC**.
 
 > A periodic client→server keepalive (RTP PT 101) was described by an alternative client but was **not present** in the captured native session; treat a media keepalive as OPTIONAL (implementation-defined).
 
@@ -787,6 +799,8 @@ Media is protected with standard SRTP (RFC 3711):
 - the 80-bit tag is computed over the SRTP packet (header + encrypted payload) concatenated with the 32-bit ROC; ROC is tracked per SSRC;
 - SRTCP appends a 32-bit trailer word carrying a 31-bit SRTCP index plus a top-bit encrypt (E) flag.
 
+**Per-leg keys.** Each leg has its own key pair (§10.3): audio `key1`/`key2` for UDP `P`, video for `P+1`. A client's RTCP for a leg MUST be sent to **that leg's port** under that leg's viewer→server key; the host's RTCP on a leg authenticates with that leg's server→viewer key. Video RTCP sent to the audio port under the video key cannot be authenticated by the audio stream, which then logs an RTCP timeout every second (`Last RTCP packet receive time: nan`). A client SHOULD send a Receiver Report on **both** legs about once a second, as the native viewer does.
+
 **Replay**: receivers maintain per-SSRC ROC/sequence state; out-of-window or duplicate packets are discarded. This media cipher is distinct from, and independent of, the AES-128-CBC control record layer (§6.4); there is no SFrame layer or second encryption pass on the media payload.
 
 ### 10.6 HEVC RTP Payload Format (Apple RFC 7798 Variant)
@@ -799,6 +813,8 @@ After SRTP decryption, the payload carries H.265/HEVC NAL units in an Apple vari
 
 NAL units are ordered across SSRCs by decoding-order number to feed a single decoder (§10.7). Honoring Apple's DONL placement is mandatory; a decoder assuming stock RFC 7798 mis-parses the NAL headers.
 
+**DONL is present only in the multi-tile stream.** With `tilesPerFrame = 1` (§10.7) the host sends plain RFC 7798 payloads **without any DONL**. A receiver that supports both SHOULD detect the layout from an Aggregation Packet: the host sends VPS/SPS/PPS in one at every IDR, and only one of the two layouts tiles the packet exactly with valid NAL headers.
+
 ### 10.7 HEVC Codec Profile and Tiling
 
 - Codec **HEVC Range Extensions (RExt), 4:4:4 chroma, 8-bit**; decoders deliver `kCVPixelFormatType_444YpCbCr8BiPlanarFullRange` (`nv24`/`444f`) or `yuv444p`.
@@ -806,6 +822,7 @@ NAL units are ordered across SSRCs by decoding-order number to feed a single dec
 - All four tile streams MUST be fed to a **single** HEVC decoder instance: the encoder uses cross-tile picture references (a P-frame on one SSRC references picture-order-count values produced on another SSRC); per-tile decoders fail with missing-reference errors. The base SSRC carries IDRs; the other three carry only inter-coded frames; a single shared-DPB decoder fed all four in decoding order decodes every tile.
 - IDR access units appear only on the **base SSRC** (tile 0); a client SHOULD treat any IDR as a DPB reset for all tiles. Presentation recomposites the four tiles vertically in SSRC order.
 - The exact tile-to-screen geometry rules (strip ordering, CTU padding) beyond the observed four-strip model are a **revision gap**.
+- **`tilesPerFrame`** (video offer field 6) is honoured: `1` gives one picture of the whole display on a single SSRC, without DONL (§10.6). Measured at 3840×2160: the host then sent ~57.5 pictures/s instead of 60, and software decode cost per picture was unchanged, so the default of 4 remains preferable for decoding. [REMOTEX] uses `1` (simpler depacketization, no cross-tile references). Each strip is 256 rows for [REMOTEX]'s geometry and 544 rows at 3840×2160 here.
 
 ### 10.8 RTCP Feedback and Loss Recovery
 
@@ -819,7 +836,37 @@ Media RTCP is rtcp-muxed onto each media port (§10.4). Observed native-client f
 
 > A different interoperable client uses AVPF feedback instead: FIR (PT 206, FMT 4), PLI (PT 206, FMT 1), generic NACK (PT 205, FMT 1), an empty SR (PT 200), and an APP packet for long-term-reference acknowledgment. Servers accept both feedback styles. The exact server reference-selection policy on loss, and the APP/LTR acknowledgment semantics and cadence, are a **revision gap**.
 
-A client without a live feedback loop (e.g. replaying a capture) cannot recover from a lost reference picture; a live client relies on FIR/NACK/LTR to keep the shared decoder synchronized.
+A client without a live feedback loop (e.g. replaying a capture) cannot recover from a lost reference picture; a live client relies on FIR/NACK/LTR to keep the shared decoder synchronized. A PLI or FIR brings an IDR within about 30 ms ([REMOTEX]); the host logs `Request key frame too soon, discard` for requests that come too close together.
+
+#### 10.8.1 Rate Control (`RCTL`)
+
+The host's video encoder follows AVConference's rate controller (`AVCRateController`, "feedback-only" rate adaptation). It is bounded by the screen-sharing video profile to **20–60 Mbit/s** (`vcMediaStreamTXMinBitrate`/`TXMaxBitrate`); the offer's bitrate entries did not change these bounds. The controller moves **only on the viewer's `RCTL` reports**. Without them it stays at its starting target (`targetBitrate=20771 kbps`, `RemoteBWE=0`, `RTT=0`) for the whole session, which limits picture quality under fast motion (e.g. text after fast scrolling at 3840×2160). The host logs the controller's state every few seconds (`printRateControllerHealthPrint`: target, cap, actual bitrate, remote BWE, RTT, one-way delay, loss).
+
+- **Packet.** An RTCP APP packet (PT 204) with the 4-byte name `RCTL` and a 20-byte big-endian payload, sent as SRTCP on the **video** leg. It MUST be the only packet in its datagram: inside a compound packet the host rejects it as a bad APP packet ([REMOTEX]).
+
+```text
++0   u8   0x85
++1   u8   a millisecond figure / 20, meaning unknown; 0 is accepted
++2   u16  4 (payload length in words after this field)
++4   u16  echo: RTP timestamp of the last received video packet >> 8
++6   u32  0
++10  u16  milliseconds since that packet arrived
++12  u16  viewer clock, 1/1024 s
++14  u16  one-way relative delay, seconds × 8192, ≤ 0xffff
++16  u16  bursty loss (top 4 bits) | video packets received mod 4096 (running count)
++18  u16  bandwidth estimate, kbit/s
+```
+
+- **Cadence.** Every 50 ms once video has arrived, as the native viewer does; the count and delay restart with each new stream (SSRC).
+- **RTT.** The host keeps a history of what it sent, keyed by the video RTP timestamp (24 kHz) >> 8, and takes the round-trip time from the echo and the hold time.
+- **What moves the target.** The one-way delay. The receiver samples, per picture from its first packet, the lag = arrival − RTP timestamp/24 kHz (both relative to the stream's first picture). A short average (0.9/0.1) and a long one (0.9999/0.0001) are kept, and the delay reported is short − long (0 when negative, the long average then taking the short one's value). With a low delay the target rises from the floor to near the cap within about 3 s; a growing delay (a slow link or a busy receiver) walks it back down. Reported loss and the bandwidth estimate did not move it ([REMOTEX]); TMMBR (RFC 5104) was ignored.
+- **Measured.** With RCTL the controller showed `targetBitrate=58448 kbps`, `RemoteBWE=60000`, `RTT` 1–10 ms, and the stream arrived at 40–60 Mbit/s (vs. ~20 without), matching the value [REMOTEX] reports for Apple's viewer. On a slow software-decoding viewer the host lowered its target on a delay spike and recovered.
+
+The packet layout and the delay estimator are as described by [REMOTEX]; the controller behaviour was confirmed independently by an interoperable client against the host's log.
+
+#### 10.8.2 Liveness
+
+A still screen sends no pictures (for as long as it stays still), but the host keeps sending a Sender Report on each leg about once a second. A client can therefore tell a still screen (reports keep arriving) from a stopped stream (neither media nor RTCP). The native viewer ends the session after 16 of its 3-second RTCP timeouts on a leg (48 s), and gives up on a stream that has not started after three ([REMOTEX]). Every display change stops **both** legs until the new stream starts; the next offer restarts both under new SSRCs on the same ports. While the audio leg runs, the host mutes its own sound output ([REMOTEX]).
 
 ### 10.9 Dynamic Resolution in Media Mode
 
@@ -917,6 +964,7 @@ A general principle: failures SHOULD close the connection (or, for media, fall b
 | Media negotiation (`0x1c`) failure or timeout | Profile C: SHOULD abandon the media path and continue on the framebuffer path |
 | Sustained media decode failure (no recoverable reference) | Profile C: SHOULD request a keyframe (R-C8); on persistent failure SHOULD fall back to the framebuffer path |
 | SRTP authentication failure / replayed packet | MUST discard the packet; MUST NOT close the media transport for a single failure |
+| Neither media nor host RTCP on the video leg for an extended period (native viewer: 48 s) | Profile C: SHOULD treat the media stream as dead (a still screen keeps its Sender Reports coming, §10.8.2) |
 
 ## 13. Security Considerations
 
@@ -972,6 +1020,7 @@ This document has no IANA actions.
 - [AVPF] J. Ott et al., "Extended RTP Profile for RTCP-Based Feedback (RTP/AVPF)", RFC 4585.
 - [CCM] S. Wenger et al., "Codec Control Messages in the RTP/AVPF", RFC 5104.
 - [H261-RTP] T. Turletti, C. Huitema, "RTP Payload Format for H.261 Video Streams", RFC 2032 (legacy FIR, PT 192).
+- [REMOTEX] "Apple RFB 003.889, as measured", protocol notes of the remotex project, `docs/apple-vnc-889.md`, https://github.com/andrewtheguy/remotex (measured against macOS 26.5–26.6 virtual machines, July–September 2026). Cited for facts only; the project declares no license.
 - [CHACHA] Y. Nir, A. Langley, "ChaCha20 and Poly1305 for IETF Protocols", RFC 8439 (advertised in the SRP option string but not used by the control record layer).
 
 ## Appendix A. Encoding Registry
@@ -1107,4 +1156,6 @@ Derived from packet captures, runtime traces, and static analysis of `screenshar
 - **`0x3f3` 3-bit command-code → meaning mapping** — all other MVS framing is recovered (§8.9.4).
 - `0x3ea` rectangle body beyond pre-processing (§8.9.3).
 - **ViewerInfo bits 30/31/32/35/81** (§5.5) — viewer-internal: tested neither in `screensharingd` nor `ScreensharingAgent` (the Agent receives digested flags, not the raw bitmap).
+- **Rate control and frame rate:** the meaning of `RCTL` payload byte +1 and whether sustained reported loss lowers the target (§10.8.1); what fixes the encoder at 60 fps regardless of the virtual display's refresh (§7.2).
+- **`0x09` body:** `selected_screen` (static analysis) vs. push interval in µs ([REMOTEX] measurement) (§8.11).
 - **`0x14` MiscStatus `cmd` space** (a live `cmd=4` is unexplained, §8.2.1); **RTCP APP/LTR** ack semantics + server reference-selection on loss (§10.8); **§10.9** dynamic-resolution renegotiation specifics (needs a resize harness); `generation` counter increment semantics (§6.2); and URL-parameter value enumeration (Appendix B).
