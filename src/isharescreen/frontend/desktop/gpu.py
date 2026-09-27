@@ -370,8 +370,11 @@ class Renderer:
         # sprite pixel = 1 content texel), so the cursor tracks the zoomed
         # content rather than staying frozen at native size.
         self._cursor_scale = 1.0
+        # The host ships cursors at ~1x (the arrow is 28x40, HiDPI or not), so
+        # a HiDPI canvas magnifies them 2x: linear keeps the edges smooth
+        # where nearest made them blocky. 1x canvases don't magnify.
         self._cursor_sampler = device.create_sampler(
-            mag_filter=wgpu.FilterMode.nearest,
+            mag_filter=wgpu.FilterMode.linear,
             min_filter=wgpu.FilterMode.linear,
         )
         self._cursor_uniform_buf = device.create_buffer(
