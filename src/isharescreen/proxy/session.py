@@ -372,6 +372,13 @@ class Session:
         # Per-display rects within the combined backing canvas (0x451 layout);
         # see the property `display_rects`. Also reset in `_teardown`.
         self._display_rects: list[DisplayRect] = []
+        # Return-to-virtual-display (see `_note_display_layout`).
+        self._current_display_id: Optional[int] = None
+        self._last_display_request_t = time.monotonic()
+        self._last_display_request: Optional[tuple[int, int, float]] = None
+        self._return_to_virtual_pending = False
+        self._last_return_t = 0.0
+        self._return_tries = 0
         self._needs_post_layout_fir: bool = False
         self._needs_param_harvest: bool = False
         # Cross-RTP-group accumulators for the post-resize param harvest.
@@ -854,6 +861,8 @@ class Session:
         if neg is None:
             raise RuntimeError("Not connected")
         log.info("send_dynamic_resolution: requesting %dx%d", width, height)
+        self._last_display_request_t = time.monotonic()
+        self._last_display_request = (width, height, hidpi_scale)
         msg = build_virtual_display(
             width=width, height=height, hidpi_scale=hidpi_scale, hdr=False,
         )
@@ -1733,6 +1742,13 @@ class Session:
         # Lets the frontend crop the one combined stream into per-monitor
         # windows for host↔client multi-monitor mapping.
         self._display_rects: list[DisplayRect] = []
+        # Return-to-virtual-display (see `_note_display_layout`).
+        self._current_display_id: Optional[int] = None
+        self._last_display_request_t = time.monotonic()
+        self._last_display_request: Optional[tuple[int, int, float]] = None
+        self._return_to_virtual_pending = False
+        self._last_return_t = 0.0
+        self._return_tries = 0
         self._needs_post_layout_fir = False
         self._needs_param_harvest = False
         self._harvest_vps = None
@@ -2019,6 +2035,68 @@ class Session:
 
         Session._libav_log_installed = True
         log.info("libav concealment-log handler installed (root handlers filter the noise)")
+
+    # Return to the virtual display. In curtain mode the host streams a
+    # virtual display it created for us; but on some console transitions
+    # (the user logging in or unlocking at the Mac, or the Mac waking) it
+    # silently switches the session to its PHYSICAL display (e.g. #1 at
+    # 5120x2160) — a size the viewer never asked for, which overloaded
+    # decoding. Re-sending our display request (what a window resize does
+    # manually) moves it back to a fresh virtual display.
+    _DISPLAY_REQUEST_GRACE_S: float = 10.0
+    _RETURN_TO_VIRTUAL_COOLDOWN_S: float = 15.0
+    _RETURN_TO_VIRTUAL_MAX_TRIES: int = 3
+
+    def _note_display_layout(self, rects: list[DisplayRect]) -> None:
+        """Called on every AppleDisplayLayout (RX thread): track which
+        display we're on and arm a return when the host switched displays
+        without us asking."""
+        cfg = self._config
+        if (not getattr(cfg, "curtain", True) or getattr(cfg, "alt_session", False)
+                or len(rects) != 1
+                or os.environ.get("ISS_RETURN_TO_VIRTUAL", "1") == "0"):
+            return
+        did = rects[0].display_id
+        now = time.monotonic()
+        ours = now - self._last_display_request_t < self._DISPLAY_REQUEST_GRACE_S
+        if self._current_display_id is None or ours:
+            if ours and did != self._current_display_id:
+                self._return_tries = 0          # our request produced it
+            self._current_display_id = did
+            return
+        if did == self._current_display_id:
+            return
+        log.warning(
+            "host switched the session from display #%s to #%s without a "
+            "request (e.g. a login/unlock at the Mac); asking for the virtual "
+            "display again", self._current_display_id, did)
+        self._current_display_id = did
+        self._return_to_virtual_pending = True
+
+    def _maybe_return_to_virtual_display(self) -> None:
+        """TX loop: send the pending display request (rate-limited)."""
+        if not self._return_to_virtual_pending:
+            return
+        now = time.monotonic()
+        if now - self._last_return_t < self._RETURN_TO_VIRTUAL_COOLDOWN_S:
+            return
+        self._return_to_virtual_pending = False
+        if self._return_tries >= self._RETURN_TO_VIRTUAL_MAX_TRIES:
+            log.warning("not asking for the virtual display again: %d "
+                        "attempts didn't stick", self._return_tries)
+            return
+        req = self._last_display_request
+        if req is None and self._config.advertise is not None:
+            adv = self._config.advertise
+            req = (adv.width, adv.height, adv.hidpi_scale)
+        if req is None:
+            return
+        self._last_return_t = now
+        self._return_tries += 1
+        try:
+            self.send_dynamic_resolution(*req)
+        except Exception as e:
+            log.warning("return to virtual display failed: %s", e)
 
     def _on_libav_hwaccel_failure(self, msg: str) -> None:
         """Keep PyAV's successful software fallback, but stop HW retries."""
@@ -3428,6 +3506,7 @@ class Session:
                 )
                 if layout is not None:
                     _bw, _bh, rects = layout
+                    self._note_display_layout(rects)
                     if rects != self._display_rects:
                         self._display_rects = rects
                         log.info(
@@ -3847,6 +3926,7 @@ class Session:
                 # NACK first: a promptly repaired packet avoids the FIR/context
                 # recovery path entirely.
                 self._drain_pending_nack()
+                self._maybe_return_to_virtual_display()
                 self._drain_pending_fir()
                 self._maybe_reanchor_d3d11va_avc()
                 self._check_stall()
