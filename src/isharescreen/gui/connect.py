@@ -283,10 +283,16 @@ def _launch(values: dict) -> None:
         cmd += ["--hidpi", scale]
     if values.get("cursor", "overlay").strip() == "video":
         cmd += ["--cursor", "video"]
+    hwaccel = values.get("hwaccel", "auto").strip().lower()
+    if hwaccel and hwaccel != "auto":
+        cmd += ["--hwaccel", hwaccel]
     decoder = values.get("decoder", "auto").strip()
     if decoder and decoder != "auto":
         cmd += ["--decoder", decoder]        # explicit pin — session honours it
-    elif frontend == "desktop" and "ISS_VIDEO_CODEC" not in os.environ:
+    elif (frontend == "desktop" and "ISS_VIDEO_CODEC" not in os.environ
+            and hwaccel in ("", "auto")):
+        # (With an explicit hardware-decode choice the session resolves codec
+        # and decoder itself: this process's probe didn't see that choice.)
         # "Auto" on the desktop frontend: the GUI already probed hardware at
         # startup, so pin the DECODER here → the session skips its decoder-build
         # probe (and "hevc444 probe: unavailable" log noise) at stream start.
@@ -412,6 +418,10 @@ _FORM = """<!doctype html><html><head><title>iShareScreen — Connect</title>__H
   <label>Decoder</label>
   <select name="decoder" title="Only decoders available on this computer are listed. 'Auto' picks the best one; the rest are for pinning a specific path when debugging.">
    __DECODER_OPTIONS__
+  </select>
+  <label>Hardware decode</label>
+  <select name="hwaccel" title="Which GPU decode API the decoders use. Auto: the usual one for this system, and a hardware H.264 decoder that can't keep up switches to software by itself. Software: CPU only (with Auto codec this picks H.264, the fast codec in software). A named API: only that one.">
+   __HWACCEL_OPTIONS__
   </select>
   <label>Cursor</label>
   <select name="cursor" title="Separate: the Mac sends the pointer shape and it is drawn at your local pointer — most responsive. In video: the Mac draws the pointer into the video — sharp on HiDPI and hidden during full-screen video, but it moves with the video stream.">
@@ -675,6 +685,34 @@ def _decoder_options_html() -> str:
     return "\n   ".join(opts)
 
 
+# The --hwaccel APIs that exist on each client platform (the dropdown also
+# requires PyAV's FFmpeg to have been built with them).
+_PLATFORM_HWACCEL_APIS = {
+    "linux": ("vaapi", "cuda"),
+    "win32": ("d3d11va", "d3d12va", "dxva2", "cuda"),
+    "darwin": ("videotoolbox",),
+}
+
+
+def _hwaccel_options_html() -> str:
+    """<option>s for the hardware-decode dropdown: Auto, Software, and the
+    decode APIs this platform has and PyAV's FFmpeg was built with."""
+    import html as _h
+    opts = ['<option value="auto" selected>Auto</option>',
+            '<option value="software">Software (CPU)</option>']
+    try:
+        from isharescreen.proxy.media.hwcaps import hwdevices_available
+        built = set(hwdevices_available())
+    except Exception:
+        built = set()
+    plat = "linux" if sys.platform.startswith("linux") else sys.platform
+    for api in _PLATFORM_HWACCEL_APIS.get(plat, ()):
+        if api in built:
+            opts.append(f'<option value="{_h.escape(api, quote=True)}">'
+                        f'{_h.escape(api)}</option>')
+    return "\n   ".join(opts)
+
+
 def _form_page() -> bytes:
     host = user = ""
     frontend = "browser"
@@ -694,7 +732,8 @@ def _form_page() -> bytes:
             .replace("__USER__", _html.escape(user, quote=True))
             .replace("__BROWSER_SEL__", "selected" if frontend == "browser" else "")
             .replace("__DESKTOP_SEL__", "selected" if frontend == "desktop" else "")
-            .replace("__DECODER_OPTIONS__", _decoder_options_html())).encode()
+            .replace("__DECODER_OPTIONS__", _decoder_options_html())
+            .replace("__HWACCEL_OPTIONS__", _hwaccel_options_html())).encode()
 
 
 def _dash_page() -> bytes:

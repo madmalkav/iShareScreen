@@ -150,7 +150,36 @@ _H264_HWACCELS: dict[str, tuple[str, ...]] = {
 
 
 def _h264_hwaccels() -> tuple[str, ...]:
+    from .hwcaps import hwaccel_choice
+    choice = hwaccel_choice()
+    if choice not in ("auto", "software"):
+        return (choice,)          # --hwaccel <device>: only that API
     return _H264_HWACCELS.get(sys.platform, _H264_HWACCELS["*"])
+
+
+# Measured hardware fallback. Every hardware-decoded H.264 frame is copied back
+# to system memory inside ctx.decode(), on the video thread, and some drivers
+# make that copy slow: through NVIDIA's VA driver (and CUDA) a 3840x2160
+# picture costs ~20-35 ms, so hardware decode falls behind the 60 fps stream
+# and holds the GIL long enough to starve the render thread (RTX 2080 live:
+# ~45 fps decoded but ~14 fps displayed, vs 51/51 in software). Other setups
+# (Intel/AMD VAAPI, D3D11VA, VideoToolbox, smaller canvases) copy back cheaply.
+# So measure instead of guessing: time each hardware decode call and, when the
+# decoder is busy for most of the wall-clock time for several windows in a row
+# while pictures keep arriving, switch this session to software on the next
+# intra frame. Only in automatic mode (an explicit --hwaccel is honoured) and
+# one-way per session; ISS_HW_SLOW_FALLBACK=0 disables it.
+_SLOW_WINDOW_S = 2.0          # measurement window
+_SLOW_MIN_FRAMES = 40         # ignore windows with little motion (<20 fps)
+_SLOW_BUSY = 0.75             # decode-call time / wall time that counts as "too busy"
+_SLOW_WINDOWS = 3             # consecutive busy windows before switching
+
+
+def _slow_fallback_enabled() -> bool:
+    from .hwcaps import hwaccel_choice
+    if os.environ.get("ISS_HW_SLOW_FALLBACK", "1") == "0":
+        return False
+    return hwaccel_choice() == "auto"
 
 
 # pts→tile routing map bounds. Each fed slice gets a monotonic pts and the map
@@ -273,6 +302,13 @@ class AvcDecoder:
         # when the next complete intra slice arrives, using that independently
         # decodable picture to seed an empty DPB.
         self._reference_reset_pending: bool = False
+        # Measured hardware fallback (see _SLOW_* above): wall time spent in
+        # hardware ctx.decode() calls within the current window.
+        self._slow_fallback = _slow_fallback_enabled()
+        self._load_t0: float = 0.0
+        self._load_busy_s: float = 0.0
+        self._load_frames: int = 0
+        self._load_busy_windows: int = 0
         self._reference_reset_count: int = 0
         self._reference_break_t: float = 0.0
         self._reference_break_trigger: str = ""
@@ -455,7 +491,9 @@ class AvcDecoder:
                     k: v for k, v in self._pts_submit_t.items() if k > cutoff
                 }
             try:
+                _t_dec = _time.perf_counter()
                 frames = ctx.decode(pkt)
+                self._account_decode_load(_time.perf_counter() - _t_dec)
             except Exception:
                 # Decode raised → no frame will carry this pts; drop it so the
                 # map doesn't leak the in-flight entry.
@@ -497,6 +535,46 @@ class AvcDecoder:
         if self._on_frame_published is not None:
             for ti in published:
                 self._on_frame_published(ti)
+
+    def _account_decode_load(self, seconds: float) -> None:
+        """Track how busy a hardware decoder is; caller holds _codec_lock.
+        Switches this session to software when hardware can't keep up (see
+        the _SLOW_* constants)."""
+        if self._hw_name is None or self._hw_failed:
+            return
+        now = time.monotonic()
+        if self._load_t0 == 0.0:
+            self._load_t0 = now
+        self._load_busy_s += seconds
+        self._load_frames += 1
+        elapsed = now - self._load_t0
+        if elapsed < _SLOW_WINDOW_S:
+            return
+        busy = self._load_busy_s / elapsed
+        frames = self._load_frames
+        avg_ms = self._load_busy_s / frames * 1000
+        self._load_t0, self._load_busy_s, self._load_frames = now, 0.0, 0
+        log.debug("AVC decode load: hw=%s busy=%.2f avg=%.1fms frames=%d/%.1fs",
+                  self._hw_name, busy, avg_ms, frames, elapsed)
+        if frames < _SLOW_MIN_FRAMES or busy < _SLOW_BUSY:
+            self._load_busy_windows = 0
+            return
+        self._load_busy_windows += 1
+        if not self._slow_fallback or self._load_busy_windows < _SLOW_WINDOWS:
+            return
+        failed = self._hw_name
+        self._hw_failed = True
+        log.warning(
+            "AVC hardware decode (%s) can't keep up: busy %.0f%% of the time, "
+            "%.1f ms per frame, for %d windows of %.0f s; switching this "
+            "session to software on the next intra frame (--hwaccel %s keeps "
+            "hardware)",
+            failed, busy * 100, avg_ms, _SLOW_WINDOWS, _SLOW_WINDOW_S, failed)
+        # Rebuild on the next intra frame (the context rebuild sees _hw_failed
+        # and creates a software context) and ask the host for one now.
+        self.mark_reference_chain_broken(f"{failed} too slow; switching to software")
+        for t in range(self.num_tiles):
+            self._gate.mark_decode_error(t)
 
     def mark_hwaccel_failed(self, trigger: str = "") -> None:
         """Record FFmpeg's explicit late hardware-initialization failure.

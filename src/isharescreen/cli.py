@@ -180,6 +180,21 @@ def _make_parser() -> argparse.ArgumentParser:
         ),
     )
     g.add_argument(
+        "--hwaccel", default="auto",
+        choices=["auto", "software", "vaapi", "cuda", "d3d11va", "d3d12va",
+                 "dxva2", "videotoolbox"],
+        help=(
+            "hardware decode API for the libav decoders (HEVC and H.264). "
+            "'auto' (default): the platform's usual order (Linux: VAAPI, then "
+            "CUDA; CUDA first on NVIDIA's VA driver; Windows: D3D11VA/D3D12VA; "
+            "macOS: VideoToolbox), and a hardware H.264 decoder that can't keep "
+            "up is switched to software automatically. 'software': CPU decode "
+            "only (with --codec auto this picks H.264, the fast one in "
+            "software). A device name: use only that API. See the README's "
+            "'Codecs and decoders' section."
+        ),
+    )
+    g.add_argument(
         "--codec", choices=["auto", "hevc", "avc"], default="auto",
         help=(
             "video codec: 'auto' (default) probes GPU capability and picks "
@@ -481,8 +496,12 @@ def _run_frontend(config: SessionConfig, args: argparse.Namespace) -> int:
             from .proxy.media.registry import resolve_codec
             if resolve_codec("auto") == "avc":
                 os.environ["ISS_VIDEO_CODEC"] = "avc"
-                from .proxy.media.registry import AVC_FALLBACK_NOTICE
-                log.warning("%s", AVC_FALLBACK_NOTICE)
+                if getattr(args, "hwaccel", "auto") == "software":
+                    log.info("--hwaccel software: using H.264 4:2:0, the fast "
+                             "codec in software (--codec hevc for 4:4:4)")
+                else:
+                    from .proxy.media.registry import AVC_FALLBACK_NOTICE
+                    log.warning("%s", AVC_FALLBACK_NOTICE)
         from isharescreen.frontend.desktop.app import run as run_desktop
         # --display: default (omitted) auto-opens one window per host monitor if
         # the host has more than one; a single-monitor host stays one window with
@@ -547,6 +566,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         _os.environ["ISS_DECODER"] = args.decoder
     if args.codec and args.codec != "auto":
         os.environ["ISS_VIDEO_CODEC"] = args.codec
+    if getattr(args, "hwaccel", "auto") != "auto":
+        os.environ["ISS_HWACCEL"] = args.hwaccel
     if getattr(args, "cursor", "overlay") == "video":
         os.environ["ISS_VIDEO_CURSOR"] = "1"
     signal.signal(signal.SIGINT, signal.default_int_handler)

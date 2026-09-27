@@ -1161,7 +1161,10 @@ class Session:
         import os as _os
         import sys as _sys
         from .media import registry
-        prefer_hwaccel = _os.environ.get("ISS_FORCE_SW_HEVC", "0") == "0"
+        from .media.hwcaps import hwaccel_choice
+        _hw_choice = hwaccel_choice()
+        prefer_hwaccel = (_os.environ.get("ISS_FORCE_SW_HEVC", "0") == "0"
+                          and _hw_choice != "software")
         # Decoder selection. On macOS the native VideoToolbox path
         # (VTDecompressionSession, vtdecode.py) decodes Apple's stream the way
         # its own viewer does — VideoToolbox manages the DPB and conceals the
@@ -1193,11 +1196,9 @@ class Session:
                 log.info("AVC: hardware decode + automatic IDR re-anchor "
                          "(every ~%d frames since IDR, d3d11va POC-wrap "
                          "workaround)", self._AVC_REANCHOR_FRAMES)
-            elif (_sys.platform == "win32"
-                    and _os.environ.get("ISS_AVC_HWACCEL", "1") == "0"):
+            elif _os.environ.get("ISS_AVC_HWACCEL", "1") == "0":
                 avc_prefer_hwaccel = False
-                log.info("AVC: forcing software decode "
-                         "(ISS_AVC_HWACCEL=0; d3d11va POC-wrap workaround)")
+                log.info("AVC: forcing software decode (ISS_AVC_HWACCEL=0)")
             _pf = avc_prefer_hwaccel
             _override = registry.normalize_override(_decoder_choice, "avc")
         else:
@@ -1218,7 +1219,12 @@ class Session:
                 f"no usable decoder for codec {self._video_codec!r} "
                 f"(override={_override!r})")
         if not prefer_hwaccel:
-            log.info("ISS_FORCE_SW_HEVC=1: HW decoders disabled")
+            log.info("hardware decoders disabled (%s)",
+                     "--hwaccel software" if _hw_choice == "software"
+                     else "ISS_FORCE_SW_HEVC=1")
+        elif _hw_choice != "auto":
+            log.info("--hwaccel %s: libav decoders use only %s (software if "
+                     "it can't open)", _hw_choice, _hw_choice)
         self._decoder.set_params(burst.vps, burst.sps, burst.all_pps)
         self._avc_cfg_sps = burst.sps or b""
         self._decoder.start()
