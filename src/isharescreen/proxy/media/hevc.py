@@ -187,6 +187,10 @@ _PLATFORM_HWACCELS: dict[str, tuple[str, ...]] = {
 
 
 def _platform_hwaccels() -> tuple[str, ...]:
+    from .hwcaps import hwaccel_choice
+    choice = hwaccel_choice()
+    if choice not in ("auto", "software"):
+        return (choice,)          # --hwaccel <device>: only that API
     order = _PLATFORM_HWACCELS.get(sys.platform, _PLATFORM_HWACCELS["*"])
     # When VAAPI itself runs on NVIDIA's driver (nvidia-vaapi-driver), it is
     # a translation layer over the same NVDEC engine CUDA drives directly;

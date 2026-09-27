@@ -136,6 +136,81 @@ For CI / scripted use:
 echo "$PASSWORD" | iss --headless --host mac.local -u me --password-stdin --auto-quit-secs 30
 ```
 
+## Codecs and decoders
+
+The Mac can send the screen in one of two codecs, and iss can decode each one
+in several ways. The defaults pick the best combination for your machine;
+these options exist for when they don't, or for comparing.
+
+### Codec (`--codec`)
+
+| codec | picture | cost to decode |
+|---|---|---|
+| **HEVC 4:4:4** (`--codec hevc`) | Full colour resolution: sharpest text, including coloured text. What Apple's own viewer uses. | Needs a GPU that decodes HEVC 4:4:4 (Apple silicon, NVIDIA RTX 20 and newer, Intel 11th gen and newer), or a fast CPU. |
+| **H.264 4:2:0** (`--codec avc`) | Colour at half resolution: coloured text (red/orange especially) and thin coloured lines look softer. | Decoded in hardware by almost any GPU from the last decade, and cheap in software. |
+
+`--codec auto` (the default) uses HEVC 4:4:4 when a hardware HEVC 4:4:4 decoder
+passes a quick test at startup, and H.264 otherwise. It prints a warning when it
+falls back to H.264, because the picture is lower quality. The browser frontend
+always uses H.264 (browsers decode it themselves).
+
+### Hardware decode API (`--hwaccel`)
+
+| value | meaning |
+|---|---|
+| `auto` (default) | The usual API for your system: Linux VAAPI then CUDA (CUDA first when VAAPI runs on NVIDIA's driver), Windows D3D11VA/D3D12VA, macOS VideoToolbox. A hardware H.264 decoder that can't keep up is switched to software automatically (see below). |
+| `software` | CPU decode only. With `--codec auto` this picks H.264, which is the fast codec in software. |
+| `vaapi`, `cuda`, `d3d11va`, `d3d12va`, `dxva2`, `videotoolbox` | Use only this API; if it can't open, iss decodes in software and logs why. The automatic software switch is off. |
+
+The connect form has the same choice as **Hardware decode**, listing only the APIs
+your iss install supports. `iss --list-decoders` shows the decoders and the
+hardware APIs available on this machine.
+
+### Decoder (`--decoder`)
+
+Normally `auto`. Pinning one is mostly for debugging:
+
+| decoder | codec | where | notes |
+|---|---|---|---|
+| `vt-hevc444` | HEVC 4:4:4 | macOS | Native VideoToolbox; the macOS default. |
+| `libav-hevc444` | HEVC 4:4:4 | all | FFmpeg with the `--hwaccel` API; the Linux/Windows default. |
+| `qsv-hevc444` | HEVC 4:4:4 | Windows, Linux | Intel Quick Sync; used where the generic path lacks 4:4:4. |
+| `libav-hevc444-sw` | HEVC 4:4:4 | all | Software; slow at high resolutions. |
+| `libav-avc420` | H.264 4:2:0 | all | FFmpeg with the `--hwaccel` API, software if none. |
+
+### Which combination to use
+
+| your machine | recommended | notes |
+|---|---|---|
+| Apple silicon Mac | defaults (HEVC, VideoToolbox) | |
+| Intel Mac | `--codec avc` | Most Intel Macs can't decode HEVC 4:4:4 in hardware. On a 2015 MacBook Pro, HEVC ran at ~28 fps with gray patches, while H.264 ran at ~60 fps (in software there, as VideoToolbox H.264 failed to start at that size). |
+| Linux/Windows, NVIDIA RTX 20 or newer | defaults (HEVC, CUDA/VAAPI or D3D11VA) | Tested on an RTX 2080: 4K and 5120×2160 at ~60–70 fps with a fraction of a CPU core. |
+| NVIDIA GTX 10 or older | defaults (H.264) | These can't decode HEVC 4:4:4. At 4K, H.264 through NVIDIA's VA driver is slower than software (each frame is copied back from the GPU), so iss switches to software when it measures that. |
+| Intel 11th gen or newer | defaults | Should get HEVC 4:4:4 in hardware via VAAPI or Quick Sync (untested here). |
+| AMD | defaults (H.264) | AMD GPUs don't decode HEVC 4:4:4 as far as we know, so auto picks H.264 in hardware (untested here). |
+| older Intel, or no GPU | defaults (H.264), or `--hwaccel software` | |
+
+### Automatic switch to software (H.264)
+
+In `--hwaccel auto` mode, iss times each hardware H.264 decode. If the decoder is
+busy more than 75% of the time for three 2-second windows in a row while the picture
+is moving, it switches the session to software on the next keyframe and logs
+the numbers. Example: an RTX 2080 decoding 4K H.264 through VAAPI was busy 93%
+of the time (22 ms per frame) and displayed ~14 fps; after the switch, software
+showed a steady 51 fps (all the Mac sent). Set `ISS_HW_SLOW_FALLBACK=0`, or pick
+an API with `--hwaccel`, to keep hardware.
+
+### Troubleshooting
+
+- **Choppy picture or gray patches:** the decoder can't keep up. Try
+  `--codec avc`, a smaller `--advertise`, or a different `--hwaccel`.
+- **Text is blurry for a moment after scrolling, then sharpens:** that's the
+  Mac's video encoder, not iss. It sends roughly 20 Mbit/s at most whatever
+  the resolution, so a smaller `--advertise` (e.g. `1600x900 --hidpi on`) gives
+  it more bits per pixel and cleaner scrolling, at the cost of a smaller desktop.
+- **Coloured text looks soft:** you're on H.264 (4:2:0). Use HEVC if your
+  hardware allows it.
+
 ## License
 
 AGPL-3.0-or-later. See [LICENSE](LICENSE).

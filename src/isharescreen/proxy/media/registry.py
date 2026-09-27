@@ -141,7 +141,7 @@ _REGISTRY: list[DecoderSpec] = [
                 note="libav software HEVC 4:4:4 — last resort; slow for live 4-tile streams"),
     DecoderSpec("libav-avc420", "avc", "420", ("*",), "hardware", 50,
                 available=lambda: True, build=_build_avc,
-                note="libav H.264 + platform hwaccel (HW by default; SW fallback, opt back to SW via ISS_AVC_HWACCEL=0)"),
+                note="libav H.264 + platform hwaccel (HW by default; SW if HW can't open or can't keep up; --hwaccel software forces SW)"),
 ]
 
 

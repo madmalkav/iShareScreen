@@ -47,6 +47,18 @@ _PROBE_HWACCELS: dict[str, tuple[str, ...]] = {
 
 _cache: dict[str, bool] = {}
 
+# `--hwaccel` / ISS_HWACCEL: which hardware decode API the libav decoders use.
+# "auto" = the per-platform order (and the measured fallback may still switch a
+# too-slow hardware H.264 decoder to software); "software" = no hardware decode;
+# a device name = only that API (falls back to software if it can't open).
+HWACCEL_CHOICES = ("auto", "software", "vaapi", "cuda", "d3d11va", "d3d12va",
+                   "dxva2", "videotoolbox")
+
+
+def hwaccel_choice() -> str:
+    """The user's --hwaccel choice (ISS_HWACCEL), normalised; 'auto' if unset."""
+    return os.environ.get("ISS_HWACCEL", "auto").strip().lower() or "auto"
+
 
 def hwdevices_available() -> tuple[str, ...]:
     """Hardware device types PyAV's FFmpeg was built with (e.g. ``vaapi``,
@@ -149,12 +161,16 @@ def hevc444_decode_method() -> "str | None":
         _method_cache["method"] = ""
         return None
     method = ""
-    if sys.platform == "darwin":
+    choice = hwaccel_choice()
+    if choice == "software":
+        pass                      # --hwaccel software: no hardware 4:4:4
+    elif sys.platform == "darwin":
         method = "libav"          # native VideoToolbox path (vtdecode.py)
     else:
-        if sys.platform.startswith("linux"):
+        if sys.platform.startswith("linux") and choice == "auto":
             _warn_if_no_vaapi()
-        hwaccels = _PROBE_HWACCELS.get(sys.platform, _PROBE_HWACCELS["*"])
+        hwaccels = (_PROBE_HWACCELS.get(sys.platform, _PROBE_HWACCELS["*"])
+                    if choice == "auto" else (choice,))
         if any(_probe_one(h) for h in hwaccels):
             method = "libav"
         elif _qsv_hevc444():
