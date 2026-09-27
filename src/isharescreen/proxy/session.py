@@ -847,10 +847,15 @@ class Session:
             width=width, height=height, hidpi_scale=hidpi_scale, hdr=False,
         )
         neg.cipher.encrypt_and_send(neg.sock, msg)
-        # Re-arm TCP and nudge encoder with FIRs for fresh IDRs.
+        # Re-arm the TCP side with a 1x1 incremental request (as the regular
+        # cursor poll does) and nudge the encoder with FIRs for fresh IDRs.
+        # Not a full-screen request: a read sized for the old display racing
+        # a shrink can crash the host's ScreensharingAgent, losing the virtual
+        # display (remotex protocol notes, "Resizing a High Performance
+        # display"), and the full-screen answer also pulls RFB pixels we skip.
         try:
             neg.cipher.encrypt_and_send(
-                neg.sock, build_fbu_request(incremental=False)
+                neg.sock, build_fbu_request(incremental=True, w=1, h=1)
             )
         except OSError:
             pass
