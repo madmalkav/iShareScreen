@@ -376,6 +376,12 @@ class Session:
         self._ssrc_blacklist: set[int] = set()
         self._last_profile_good: list[int] = []
         self._last_profile_clean: list[int] = []
+        # Frames handed to the frontend per tile (Session.get_frame returned a
+        # frame) — the displayed rate, the same for every decoder. `clean_rates`
+        # is counted where each decoder publishes (HEVC/VT: at decode; AVC: at
+        # get_frame), so it can't show a render-side bottleneck on HEVC.
+        self._shown_counts: list[int] = []
+        self._last_profile_shown: list[int] = []
 
         # Cipher state for the TX channel.
         self._video_decryptor: Optional[SRTPDecryptor] = None
@@ -674,7 +680,12 @@ class Session:
             raise ValueError(
                 f"tile_idx {tile_idx} out of range [0, {self.num_tiles})"
             )
-        return self._decoder.get_frame(tile_idx)
+        tf = self._decoder.get_frame(tile_idx)
+        if tf is not None:
+            if len(self._shown_counts) != self.num_tiles:
+                self._shown_counts = [0] * self.num_tiles
+            self._shown_counts[tile_idx] += 1
+        return tf
 
     def wait_for_fresh_tile(self, timeout: float = 0.033) -> bool:
         """Block until any tile publishes a new frame, or `timeout` elapses.
@@ -3820,6 +3831,13 @@ class Session:
             cdelta = list(clean)
         self._last_profile_clean = list(clean)
         clean_rates = [round(d / elapsed, 1) for d in cdelta]
+        shown = list(self._shown_counts) or [0] * len(clean)
+        sbase = (self._last_profile_shown
+                 if len(self._last_profile_shown) == len(shown)
+                 else [0] * len(shown))
+        shown_rates = [round(max(0, shown[i] - sbase[i]) / elapsed, 1)
+                       for i in range(len(shown))]
+        self._last_profile_shown = shown
         # Per-tile KB/s — which screen band is eating the bandwidth.
         n_t = len(clean)
         tile_kbs = []
@@ -3907,7 +3925,7 @@ class Session:
         ltr_dist = getattr(rps, "max_ref_distance", 0)
         ltr_miss = getattr(rps, "missing_ref_events", 0)
         log.debug(
-            "profile: decoder=%s tiles=%s rates=%s clean_rates=%s gray_tiles=%s fps tile_KBs=%s loss/tile=%s "
+            "profile: decoder=%s tiles=%s rates=%s clean_rates=%s shown_rates=%s gray_tiles=%s fps tile_KBs=%s loss/tile=%s "
             "ltr=ack%d/far%d/dist%d/miss%d "
             "loss_total=%d unmapped=%d "
             "ssrc_groups=%d last_publish=%.1fs ago "
@@ -3916,7 +3934,7 @@ class Session:
             "tx_pps=%.2f cursor=%dms_ago/n=%d tcp_types={%s} "
             "nalu={%s}",
             decoder_name,
-            good, rates, clean_rates, sorted(self._decoder.bad_tiles), tile_kbs, loss_delta,
+            good, rates, clean_rates, shown_rates, sorted(self._decoder.bad_tiles), tile_kbs, loss_delta,
             self._ltr_acks_sent, ltr_far, ltr_dist, ltr_miss,
             loss_total, loss_unmapped,
             ssrc_groups,
