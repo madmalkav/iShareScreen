@@ -88,6 +88,10 @@ log = logging.getLogger(__name__)
 # decoder's gate, run stall watchdog. 500 ms keeps daemon happy without
 # wasting CPU on idle ticks.
 _TX_INTERVAL_S = 0.5
+# A video SSRC counts as still sending if a packet arrived this recently.
+_SSRC_LIVE_S = 0.5
+
+
 def _rctl_enabled() -> bool:
     """RCTL rate-control reports are on by default; ISS_RCTL=0 turns them off
     (the host then stays at its 20 Mbit/s floor, the old behaviour)."""
@@ -381,6 +385,9 @@ class Session:
         self._last_tile_bytes: dict[int, int] = {}
         self._last_ssrc_adopt_ts: float = 0.0
         self._ssrc_blacklist: set[int] = set()
+        # Last packet time per video SSRC: adoption only picks a group that is
+        # still sending (see _note_unknown_ssrc).
+        self._ssrc_last_seen: dict[int, float] = {}
         self._last_profile_good: list[int] = []
         self._last_profile_clean: list[int] = []
         # Frames handed to the frontend per tile (Session.get_frame returned a
@@ -2399,6 +2406,7 @@ class Session:
             marker = bool(hdr[1] & 0x80)
 
             self._track_seq(ssrc, seq)
+            self._ssrc_last_seen[ssrc] = time.monotonic()
             self._note_unknown_ssrc(ssrc)
             tile = self._ssrc_to_tile.get(ssrc)
             if tile is not None:
@@ -2912,7 +2920,14 @@ class Session:
             self._last_publish_t > 0.0
             and now - self._last_publish_t < _SSRC_ADOPT_STALL_S
         )
-        if have_active_group and recently_published:
+        # ...unless the current group has stopped sending altogether (the host
+        # replaced the stream, e.g. the connect-time re-query streams): then
+        # a complete live group below is adopted at once instead of after the
+        # stall window.
+        current_dead = have_active_group and all(
+            now - self._ssrc_last_seen.get(s, 0.0) >= _SSRC_LIVE_S
+            for s in self._ssrc_to_tile)
+        if have_active_group and recently_published and not current_dead:
             return
         # Once at least 4 unknown SSRCs each have ≥N packets, swap maps
         # and request fresh IDRs. Skip any SSRC that's been part of a
@@ -2937,21 +2952,31 @@ class Session:
         # correctly and silently drops the others. Build runs of
         # consecutive SSRCs and adopt the first complete run. (want=1 → a
         # single-SSRC single-picture stream; want=4 → the tiled stream.)
-        new_group: list[int] | None = None
+        #
+        # Only a group that is STILL SENDING qualifies, and the most recent
+        # one wins. While the connect-time 0x1c negotiation re-queries, the
+        # host starts (and tears down within ~100 ms) a stream per query,
+        # each with its own random SSRCs and a short burst that passes the
+        # packet threshold. Taking the lowest-numbered run adopted those
+        # dead groups one by one, 2 s apart (the stall guard), before
+        # reaching the live stream: up to ~12 s of gray/low-bitrate start.
+        runs: list[list[int]] = []
         run = [candidates[0]]
-        if want == 1:
-            new_group = run
-        else:
-            for s in candidates[1:]:
-                if s - run[-1] <= 1 and len(run) < want:
-                    run.append(s)
-                    if len(run) == want:
-                        new_group = run
-                        break
-                else:
-                    run = [s]
-        if new_group is None:
-            return  # no consecutive run of `want` yet — wait for more data
+        for s in candidates[1:]:
+            if s - run[-1] <= 1 and len(run) < want:
+                run.append(s)
+            else:
+                if len(run) == want:
+                    runs.append(run)
+                run = [s]
+        if len(run) == want:
+            runs.append(run)
+        seen = self._ssrc_last_seen
+        live = [r for r in runs
+                if all(now - seen.get(s, 0.0) < _SSRC_LIVE_S for s in r)]
+        if not live:
+            return  # no complete, still-sending group yet — wait for more data
+        new_group = max(live, key=lambda r: min(seen.get(s, 0.0) for s in r))
         new_map = {s: i for i, s in enumerate(new_group)}
         if new_map == self._ssrc_to_tile:
             return
