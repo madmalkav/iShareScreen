@@ -58,6 +58,7 @@ from .protocol.negotiation import (
 )
 from .protocol.offers import extract_offer_ssrc, create_offers
 from .protocol.rfb import warmup_tcp, parse_apple_display_layout, DisplayRect
+from .protocol.rctl import RCTL_INTERVAL_S, RctlState, build_rctl
 from .protocol.rtcp import (
     build_empty_sr,
     build_fir,
@@ -87,6 +88,12 @@ log = logging.getLogger(__name__)
 # decoder's gate, run stall watchdog. 500 ms keeps daemon happy without
 # wasting CPU on idle ticks.
 _TX_INTERVAL_S = 0.5
+def _rctl_enabled() -> bool:
+    """RCTL rate-control reports are on by default; ISS_RCTL=0 turns them off
+    (the host then stays at its 20 Mbit/s floor, the old behaviour)."""
+    return os.environ.get("ISS_RCTL", "1") != "0"
+
+
 _RTCP_SR_EVERY_N_TICKS = 10              # 10 × 0.5 s = 5 s SR cadence
 # How often to emit the per-tile profile snapshot. 4 ticks × 0.5 s = 2 s
 # cadence — enough granularity to spot a stuck tile within a few seconds
@@ -381,6 +388,10 @@ class Session:
         # is counted where each decoder publishes (HEVC/VT: at decode; AVC: at
         # get_frame), so it can't show a render-side bottleneck on HEVC.
         self._shown_counts: list[int] = []
+        # RCTL rate-control report state (protocol/rctl.py), fed by the video
+        # process loop and read by the iss-rctl thread.
+        self._rctl = RctlState()
+        self._rctl_lock = threading.Lock()
         self._last_profile_shown: list[int] = []
 
         # Cipher state for the TX channel.
@@ -1696,6 +1707,8 @@ class Session:
             ("iss-tcp-rx", self._tcp_rx_loop),
             ("iss-tx", self._tx_loop),
         ]
+        if _rctl_enabled():
+            targets.append(("iss-rctl", self._rctl_loop))
         # Note: there's no separate iss-audio-rx thread because Apple
         # rtcp-muxes audio onto _sock_ctrl (UDP 5900); the ctrl process
         # loop routes audio RTP to _handle_audio_rtp.
@@ -1703,6 +1716,41 @@ class Session:
             t = threading.Thread(target=target, name=name, daemon=True)
             t.start()
             self._threads.append(t)
+
+    # ── rate-control reports (RCTL) ──────────────────────────────────
+
+    def _rctl_loop(self) -> None:
+        """Send an RCTL report every 50 ms once video has arrived, alone in
+        its datagram, as SRTCP on the video port — the feedback the host's
+        rate controller needs to leave its 20 Mbit/s floor (see
+        protocol/rctl.py)."""
+        bwe = int(os.environ.get("ISS_RCTL_BWE_KBPS", "60000"))
+        sent = 0
+        while not self._stop_evt.wait(RCTL_INTERVAL_S):
+            enc, sock, ssrc = self._srtcp_enc, self._sock_video, self._our_video_ssrc
+            if enc is None or sock is None or ssrc is None:
+                continue
+            now = time.monotonic()
+            with self._rctl_lock:
+                st = self._rctl
+                if st.last_ts is None:
+                    continue
+                pkt = build_rctl(
+                    ssrc, echo_ts=st.last_ts,
+                    hold_ms=(now - st.last_arrival) * 1000, clock_s=now,
+                    delay_s=st.delay_s, received=st.received, bwe_kbps=bwe)
+                delay_ms = st.delay_s * 1000
+            try:
+                sock.sendto(enc.protect(pkt), (self._dest_host, self._video_dest_port))
+            except OSError as e:
+                log.debug("RCTL send failed: %s", e)
+                continue
+            sent += 1
+            if sent == 1:
+                log.info("rate control: sending RCTL reports every %d ms "
+                         "(ISS_RCTL=0 disables)", int(RCTL_INTERVAL_S * 1000))
+            elif sent % 200 == 0:
+                log.debug("RCTL: %d sent, delay %.1f ms", sent, delay_ms)
 
     # ── decoder publish hook ─────────────────────────────────────────
 
@@ -2352,6 +2400,10 @@ class Session:
 
             self._track_seq(ssrc, seq)
             self._note_unknown_ssrc(ssrc)
+            tile = self._ssrc_to_tile.get(ssrc)
+            if tile is not None:
+                with self._rctl_lock:
+                    self._rctl.on_packet(ssrc, tile, ts, time.monotonic())
             self._queue_video_group_packet(ssrc, ts, seq, marker, payload)
 
             # Expire repair/no-marker holes even while the queue stays busy.
