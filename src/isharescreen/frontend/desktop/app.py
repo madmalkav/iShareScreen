@@ -21,7 +21,7 @@ import wgpu
 from ...proxy.protocol.negotiation import AdvertiseDims
 from ...proxy.session import Session, SessionConfig
 from .audio_sink import make_audio_sink
-from .canvas import WaylandSafeCanvas
+from .canvas import WaylandSafeCanvas, fit_size, fit_window_to_screen, usable_screen_area
 from .gpu import Renderer
 from .keymap import GLFW_KEY_TO_X11, glfw_button_to_rfb_bit
 
@@ -98,7 +98,13 @@ def _auto_advertise_dims() -> tuple[int, int]:
     try:
         glfw.init()  # idempotent; rendercanvas re-inits when it builds the window
         mon = glfw.get_primary_monitor()
-        if mon:
+        usable = usable_screen_area()
+        if usable:
+            # The work area elsewhere; on Wayland GLFW's work area is the whole
+            # output in PHYSICAL pixels (5120x2160 on a 2560x1080 @2x desktop),
+            # so this asks the compositor for the real usable logical area.
+            ww, wh = usable
+        elif mon:
             area = glfw.get_monitor_workarea(mon)
             if area and area[2] > 0 and area[3] > 0:
                 ww, wh = area[2], area[3]
@@ -368,7 +374,13 @@ def run(
     adv = config.advertise
     win_w = (adv.width if adv else 0) or scaled_w or canvas_w
     win_h = (adv.height if adv else 0) or scaled_h or canvas_h
-    window = WaylandSafeCanvas(title=title, size=(win_w, win_h), max_fps=120)
+    # Open no larger than the usable screen area (a 1920x1080 window on a
+    # 1080-high screen would push its title bar/bottom off-screen). Fitting
+    # before creation avoids a startup resize (and, in dynamic mode, a second
+    # host resize); fit_window_to_screen below also subtracts the frame where
+    # GLFW only knows it once the window exists (Windows/macOS/X11).
+    open_w, open_h = fit_size((win_w, win_h), usable_screen_area())
+    window = WaylandSafeCanvas(title=title, size=(open_w, open_h), max_fps=120)
     glfw_window = window._window  # for raw glfw input callbacks only
     # Lock the window to the content's aspect ratio so the stream always fills
     # it edge-to-edge with no letterbox side-bars (restores pre-merge behavior;
@@ -393,6 +405,7 @@ def run(
                     glfw_window, max(1, int(win_w * _f)), max(1, int(win_h * _f)))
         except Exception as _e:
             log.debug("window aspect-lock failed: %s", _e)
+    fit_window_to_screen(glfw_window)
     # In canvas-cursor mode we render the host's cursor as a wgpu overlay and
     # hide the local system pointer — but NOT yet. Hiding it now, before the
     # overlay has both a shape (a cursor pixmap arrived) and a position (the
@@ -751,6 +764,7 @@ def run(
             glfw.set_window_aspect_ratio(gw2, rw0, rh0)
         except Exception:
             pass
+        fit_window_to_screen(gw2)
         ctx2 = w2.get_context("wgpu")
         ctx2.configure(device=device, format=surface_format, alpha_mode="opaque")
         st = _types.SimpleNamespace(
