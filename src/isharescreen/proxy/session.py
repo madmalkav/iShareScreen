@@ -100,6 +100,13 @@ def _is_rtcp(pkt: bytes) -> bool:
     return len(pkt) >= 2 and (pkt[0] & 0xC0) == 0x80 and 192 <= pkt[1] <= 223
 
 
+# Media liveness (Session._check_media_liveness): warn after this long with
+# neither video nor host RTCP, end the session after the longer one (Apple's
+# viewer: 16 x its 3 s RTCP timeout).
+_MEDIA_SILENCE_WARN_S = 10.0
+_MEDIA_SILENCE_END_S = 48.0
+
+
 def _rctl_enabled() -> bool:
     """RCTL rate-control reports are on by default; ISS_RCTL=0 turns them off
     (the host then stays at its 20 Mbit/s floor, the old behaviour)."""
@@ -420,6 +427,10 @@ class Session:
         # Host SR arrivals on the audio leg, and the host's audio SSRC / top
         # sequence number, for the audio-leg receiver report.
         self._server_sr_audio: dict[int, tuple[int, float]] = {}
+        # Last authenticated RTCP from the host, either leg (see
+        # _check_media_liveness), and whether the dead-stream warning fired.
+        self._last_host_rtcp_t: float = 0.0
+        self._media_silence_warned: bool = False
         self._audio_remote_ssrc: Optional[int] = None
         self._audio_max_seq: int = 0
         self._our_video_ssrc: Optional[int] = None
@@ -3141,6 +3152,7 @@ class Session:
             decrypted = srtcp_dec.unprotect(pkt)
             if decrypted is None:
                 continue
+            self._last_host_rtcp_t = time.monotonic()
             for ssrc, ntp_mid32, arrival in parse_sr_arrivals(decrypted):
                 if not self._server_sr_audio:
                     log.info("RTCP: first host sender report on the audio leg "
@@ -3157,6 +3169,7 @@ class Session:
         decrypted = dec.unprotect(pkt)
         if decrypted is None:
             return
+        self._last_host_rtcp_t = time.monotonic()
         for ssrc, ntp_mid32, arrival in parse_sr_arrivals(decrypted):
             if not self._server_sr:
                 log.info("RTCP: first host sender report on the video leg "
@@ -3837,6 +3850,7 @@ class Session:
                 self._drain_pending_fir()
                 self._maybe_reanchor_d3d11va_avc()
                 self._check_stall()
+                self._check_media_liveness()
                 self._maybe_poll_cursor()
                 if self._tx_tick % _TX_PROFILE_EVERY_N_TICKS == 0:
                     self._log_profile_snapshot()
@@ -4392,6 +4406,39 @@ class Session:
             sent,
             self.num_tiles,
         )
+
+    def _check_media_liveness(self) -> None:
+        """Tell a still screen from a dead media stream.
+
+        A still screen sends no pictures, but the host keeps sending its RTCP
+        sender reports (about once a second on each leg), so the stall logic
+        rightly stays quiet. A stream that stopped silently sends neither and
+        used to leave the viewer on its last frame forever. With no video and
+        no host RTCP for _MEDIA_SILENCE_WARN_S, warn; after
+        _MEDIA_SILENCE_END_S (Apple's viewer ends the session after 16 of its
+        3 s RTCP timeouts, 48 s), end the session so the frontend reports it.
+
+        Only armed once host RTCP has been seen in this session: a host that
+        never sends reports keeps the old behaviour."""
+        if not self._connected or self._last_host_rtcp_t == 0.0:
+            return
+        now = time.monotonic()
+        silent = now - max(self._last_video_pkt_t, self._last_host_rtcp_t)
+        if silent < _MEDIA_SILENCE_WARN_S:
+            if self._media_silence_warned:
+                log.info("media stream alive again")
+                self._media_silence_warned = False
+            return
+        if not self._media_silence_warned:
+            self._media_silence_warned = True
+            log.warning("media stream silent for %.0f s: no video and no host "
+                        "RTCP (a still screen keeps its reports coming); the "
+                        "session ends after %.0f s", silent, _MEDIA_SILENCE_END_S)
+        if silent >= _MEDIA_SILENCE_END_S:
+            log.error("media stream dead for %.0f s (no video, no host RTCP); "
+                      "ending the session, as Apple's viewer does", silent)
+            self._connected = False
+            self._fresh_evt.set()
 
     def _check_stall(self) -> None:
         """Decoder-stall recovery. Two failure modes:
