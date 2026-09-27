@@ -187,7 +187,18 @@ _PLATFORM_HWACCELS: dict[str, tuple[str, ...]] = {
 
 
 def _platform_hwaccels() -> tuple[str, ...]:
-    return _PLATFORM_HWACCELS.get(sys.platform, _PLATFORM_HWACCELS["*"])
+    order = _PLATFORM_HWACCELS.get(sys.platform, _PLATFORM_HWACCELS["*"])
+    # When VAAPI itself runs on NVIDIA's driver (nvidia-vaapi-driver), it is
+    # a translation layer over the same NVDEC engine CUDA drives directly;
+    # CUDA measured more headroom there (RTX 2080, HEVC 4:4:4: ~102 vs ~85
+    # fps at 3840x2160, ~136 vs ~85 fps at 5120-wide strips, lower CPU), so
+    # try it first. Any other VA driver (Intel/AMD, hybrid laptops whose VAAPI
+    # is the iGPU) keeps the order. ISS_PREFER_CUDA=0 disables this.
+    if ("cuda" in order and "vaapi" in order
+            and os.environ.get("ISS_PREFER_CUDA", "1") != "0"
+            and _loaded_va_driver() == "nvidia"):
+        order = ("cuda",) + tuple(h for h in order if h != "cuda")
+    return order
 
 
 # `_TileSlot`, `_HW_FRAME_FORMATS`, and `_av_frame_to_tile` now live in
