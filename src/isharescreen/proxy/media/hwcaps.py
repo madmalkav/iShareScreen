@@ -165,7 +165,12 @@ def hevc444_decode_method() -> "str | None":
     if choice == "software":
         pass                      # --hwaccel software: no hardware 4:4:4
     elif sys.platform == "darwin":
-        method = "libav"          # native VideoToolbox path (vtdecode.py)
+        # Native VideoToolbox path (vtdecode.py) — only if VideoToolbox has a
+        # HARDWARE 4:4:4 decoder (Apple silicon). On most Intel Macs it would
+        # decode in software, too slow → H.264. If the check can't run, keep
+        # the old assumption (hardware present).
+        from .vtdecode import hevc444_hw_supported
+        method = "" if hevc444_hw_supported() is False else "libav"
     else:
         if sys.platform.startswith("linux") and choice == "auto":
             _warn_if_no_vaapi()
