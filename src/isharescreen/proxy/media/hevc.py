@@ -625,9 +625,21 @@ class HevcDecoder:
             self._gate.mark_clean(tile_idx)
         if not self._gate.should_publish(tile_idx, tile_frame):
             return None
+        held = self.__dict__.setdefault("_tiles_held", set())
         if self._startup_hold(tile_idx):
+            if tile_idx not in held:
+                held.add(tile_idx)
+                log.debug("startup hold: tile %d held (needs a keyframe)", tile_idx)
             return None
-        self.__dict__.setdefault("_tiles_shown", set()).add(tile_idx)
+        shown = self.__dict__.setdefault("_tiles_shown", set())
+        if tile_idx not in shown:
+            shown.add(tile_idx)
+            if tile_idx in held:
+                held.discard(tile_idx)
+                import time as _time
+                log.debug("startup hold: tile %d released after %.2f s",
+                          tile_idx, _time.monotonic()
+                          - getattr(self, "_codec_built_t", 0.0))
         return tile_frame
 
     def rearm_startup_hold(self) -> None:
@@ -637,6 +649,7 @@ class HevcDecoder:
         import time as _time
         self._codec_built_t = _time.monotonic()
         self._tiles_shown = set()
+        self._tiles_held = set()
 
     def _startup_hold(self, tile_idx: int) -> bool:
         """True while a tile that hasn't been shown since the decoder was
@@ -1293,6 +1306,7 @@ class HevcDecoder:
         import time as _time
         self._codec_built_t = _time.monotonic()
         self._tiles_shown = set()
+        self._tiles_held = set()
         # _try_hwaccel labels the context with the REQUESTED hwaccel, but the
         # accel only binds in get_format. e.g. DXVA2/D3D11VA are never offered
         # for HEVC 4:4:4, so on Windows Apple's stream silently decodes in
