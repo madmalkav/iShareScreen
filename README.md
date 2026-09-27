@@ -204,23 +204,14 @@ an API with `--hwaccel`, to keep hardware.
 
 - **Choppy picture or gray patches:** the decoder can't keep up. Try
   `--codec avc`, a smaller `--advertise`, or a different `--hwaccel`.
-- **Text is blurry for a moment after scrolling, then sharpens:** that's the
-  Mac's video encoder, not iss. With iss the Mac's rate controller stays at its
-  starting bitrate (~20 Mbit/s, whatever the resolution), because it doesn't
-  get the feedback it would use to ramp up (work in progress). Two workarounds:
-  - A smaller `--advertise` (e.g. `1600x900 --hidpi on`) gives it more bits
-    per pixel, at the cost of a smaller desktop.
-  - Raise the Mac's minimum video bitrate. Run this **on the host Mac** (as the
-    user who is logged in there), then reconnect:
-    ```sh
-    defaults write com.apple.VideoConference forceVideoStreamTxMinBitrate -int 50000000
-    ```
-    Tested on an M4 Mac: the stream went from ~20 to 40–60 Mbit/s (the Mac
-    caps it at 60), and fast scrolling at 3840×2160 stayed sharp. Your network
-    and decoder must handle that rate (fine on wired gigabit with a hardware
-    decoder). This is a private AVConference setting: it may also affect other
-    video from that Mac (e.g. FaceTime); that's untested. Undo it with
-    `defaults delete com.apple.VideoConference`.
+- **Text is blurry for a moment after scrolling, then sharpens:** the Mac's
+  encoder is short of bits. The Mac adapts its video bitrate (between 20 and
+  60 Mbit/s) to the viewer's rate-control reports, which iss sends like Apple's
+  viewer does; on a clean local network it runs near 60 Mbit/s. If your link or
+  decoder can't keep up, the reported delay grows and the Mac lowers the rate,
+  so some blur can return. A smaller `--advertise` (e.g. `1600x900 --hidpi on`)
+  then gives it more bits per pixel. `ISS_RCTL=0` turns the reports off (the Mac
+  then stays at 20 Mbit/s, the behaviour of older iss versions).
 - **Coloured text looks soft:** you're on H.264 (4:2:0). Use HEVC if your
   hardware allows it.
 
