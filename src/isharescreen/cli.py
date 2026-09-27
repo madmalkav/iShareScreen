@@ -469,6 +469,8 @@ def _run_frontend(config: SessionConfig, args: argparse.Namespace) -> int:
             from .proxy.media.registry import resolve_codec
             if resolve_codec("auto") == "avc":
                 os.environ["ISS_VIDEO_CODEC"] = "avc"
+                from .proxy.media.registry import AVC_FALLBACK_NOTICE
+                log.warning("%s", AVC_FALLBACK_NOTICE)
         from isharescreen.frontend.desktop.app import run as run_desktop
         # --display: default (omitted) auto-opens one window per host monitor if
         # the host has more than one; a single-monitor host stays one window with
@@ -498,6 +500,8 @@ def _run_frontend(config: SessionConfig, args: argparse.Namespace) -> int:
     # user explicitly chose a codec.
     if args.codec == "auto":
         os.environ["ISS_VIDEO_CODEC"] = "avc"
+        log.info("browser frontend: streaming H.264 4:2:0 (decoded by the "
+                 "browser); use --frontend desktop for HEVC 4:4:4")
     # Use the cursor pseudo-encoding (RFB enc 1104), same as the wgpu viewer:
     # the daemon does NOT bake the cursor into the framebuffer, it sends cursor
     # pixmaps which the browser paints as the canvas CSS cursor. This also means

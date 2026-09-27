@@ -303,6 +303,9 @@ def _launch(values: dict) -> None:
                 cmd += ["--decoder", spec.name]
                 if codec == "avc":
                     cmd += ["--codec", "avc"]
+                    from isharescreen.proxy.media.registry import (
+                        AVC_FALLBACK_NOTICE)
+                    print(f"iShareScreen: {AVC_FALLBACK_NOTICE}")
         except Exception:
             pass  # fall back to the session's own auto resolution
     if values.get("curtain") != "on":
@@ -627,6 +630,21 @@ def _spec_offerable(s, probe_ready: bool) -> bool:
         return True   # probe error → don't hide it
 
 
+def _auto_option_label(probe_ready: bool) -> str:
+    """Label for "Auto": say so when it means the lower-quality H.264 4:2:0
+    fallback (desktop frontend, no HEVC 4:4:4 hardware decoder) rather than
+    dropping quality silently."""
+    if probe_ready:
+        try:
+            from isharescreen.proxy.media.registry import resolve_codec
+            if resolve_codec("auto") == "avc":
+                return ("Auto — H.264 4:2:0 (no HEVC 4:4:4 GPU decoder; pick "
+                        "\u201cHEVC — Software (CPU)\u201d for full quality)")
+        except Exception:
+            pass
+    return "Auto (best available)"
+
+
 def _decoder_options_html() -> str:
     """<option>s for the decoder dropdown, filtered to decoders available on
     THIS machine. Waits for the startup hardware probe so the FIRST page load
@@ -635,8 +653,8 @@ def _decoder_options_html() -> str:
     probe is somehow still running after the cap do we fall back to the
     platform filter rather than hang the form."""
     import html as _h
-    opts = ['<option value="auto" selected>Auto (best available)</option>']
     probe_ready = _PROBE_DONE.wait(timeout=5.0)
+    opts = [f'<option value="auto" selected>{_h.escape(_auto_option_label(probe_ready))}</option>']
     try:
         from isharescreen.proxy.media.registry import all_specs
         for s in all_specs():

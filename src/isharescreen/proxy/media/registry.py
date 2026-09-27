@@ -231,6 +231,13 @@ def build_best(codec: str, *, override: Optional[str], num_tiles: int, **opts):
 
 # ── codec negotiation (moved here from hwcaps to break the import cycle) ──
 
+AVC_FALLBACK_NOTICE = (
+    "no hardware HEVC 4:4:4 decoder found, so --codec auto is using H.264 "
+    "4:2:0 (lower quality: chroma is subsampled). For full 4:4:4 quality use "
+    "--codec hevc (decoded in software; needs a fast CPU at high resolutions)."
+)
+
+
 def resolve_codec(choice: str) -> str:
     """Resolve a `--codec` value to a concrete 'hevc' / 'avc'. 'auto' offers
     HEVC when any 4:4:4 hardware decoder is available, else H.264 4:2:0.
@@ -273,5 +280,5 @@ def describe() -> str:
     return "\n".join(rows)
 
 
-__all__ = ["DecoderSpec", "all_specs", "candidates", "can_decode", "select",
+__all__ = ["AVC_FALLBACK_NOTICE", "DecoderSpec", "all_specs", "candidates", "can_decode", "select",
            "build_best", "normalize_override", "resolve_codec", "describe"]
