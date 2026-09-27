@@ -407,6 +407,13 @@ class Session:
         self._audio_encryptor: Optional[SRTPEncryptor] = None
         self._srtcp_dec: Optional[SRTCPDecryptor] = None
         self._srtcp_enc: Optional[SRTCPEncryptor] = None
+        self._audio_srtcp_enc: Optional[SRTCPEncryptor] = None
+        self._audio_srtcp_dec: Optional[SRTCPDecryptor] = None
+        # Host SR arrivals on the audio leg, and the host's audio SSRC / top
+        # sequence number, for the audio-leg receiver report.
+        self._server_sr_audio: dict[int, tuple[int, float]] = {}
+        self._audio_remote_ssrc: Optional[int] = None
+        self._audio_max_seq: int = 0
         self._our_video_ssrc: Optional[int] = None
         self._our_audio_ssrc: Optional[int] = None
 
@@ -1456,6 +1463,9 @@ class Session:
         self._audio_decryptor = SRTPDecryptor.from_blob(keys.audio_key_s)
         self._srtcp_dec = SRTCPDecryptor.from_blob(keys.video_key_s)
         self._srtcp_enc = SRTCPEncryptor.from_blob(keys.video_key_v)
+        # The audio leg's own SRTCP keys (reports on UDP 5900).
+        self._audio_srtcp_enc = SRTCPEncryptor.from_blob(keys.audio_key_v)
+        self._audio_srtcp_dec = SRTCPDecryptor.from_blob(keys.audio_key_s)
         if self._our_audio_ssrc is not None:
             self._audio_encryptor = SRTPEncryptor.from_blob(
                 keys.audio_key_v, self._our_audio_ssrc,
@@ -1675,6 +1685,8 @@ class Session:
         self._audio_decryptor = None
         self._audio_encryptor = None
         self._srtcp_dec = None
+        self._audio_srtcp_enc = None
+        self._audio_srtcp_dec = None
         self._srtcp_enc = None
         self._ssrc_to_tile = {}
         self._pending_groups = {}
@@ -2396,6 +2408,10 @@ class Session:
                 self._evict_stale_groups()
                 continue
 
+            if (len(pkt) >= 2 and (pkt[0] & 0xC0) == 0x80
+                    and 200 <= (pkt[1] & 0x7F) <= 207):
+                self._handle_video_rtcp(pkt)       # SRTCP muxed on the video leg
+                continue
             res = decryptor.decrypt(pkt)
             if res is None:
                 continue
@@ -3090,7 +3106,9 @@ class Session:
                 self._ctrl_q_dropped += 1
 
     def _ctrl_process_loop(self) -> None:
-        srtcp_dec = self._srtcp_dec
+        # RTCP arriving on the audio leg is SRTCP under the audio
+        # server-to-viewer key (each leg has its own keys).
+        srtcp_dec = self._audio_srtcp_dec
         if srtcp_dec is None:
             return
         q = self._ctrl_q
@@ -3112,7 +3130,26 @@ class Session:
             if decrypted is None:
                 continue
             for ssrc, ntp_mid32, arrival in parse_sr_arrivals(decrypted):
-                self._server_sr[ssrc] = (ntp_mid32, arrival)
+                if not self._server_sr_audio:
+                    log.info("RTCP: first host sender report on the audio leg "
+                             "(ssrc=0x%08x)", ssrc)
+                self._server_sr_audio[ssrc] = (ntp_mid32, arrival)
+
+    def _handle_video_rtcp(self, pkt: bytes) -> None:
+        """RTCP from the host on the video leg (sender reports), SRTCP under
+        the video server-to-viewer key. SR arrivals feed the LSR/DLSR of our
+        video receiver reports."""
+        dec = self._srtcp_dec
+        if dec is None:
+            return
+        decrypted = dec.unprotect(pkt)
+        if decrypted is None:
+            return
+        for ssrc, ntp_mid32, arrival in parse_sr_arrivals(decrypted):
+            if not self._server_sr:
+                log.info("RTCP: first host sender report on the video leg "
+                         "(ssrc=0x%08x)", ssrc)
+            self._server_sr[ssrc] = (ntp_mid32, arrival)
 
     def _handle_audio_rtp(self, pkt: bytes) -> None:
         """Decrypt an SRTP audio packet from the muxed CTRL port,
@@ -3125,6 +3162,8 @@ class Session:
         if res is None:
             return
         _hdr, payload = res
+        self._audio_remote_ssrc = struct.unpack(">I", _hdr[8:12])[0]
+        self._audio_max_seq = struct.unpack(">H", _hdr[2:4])[0]
         try:
             pcm = decoder.decode(payload)
         except Exception as e:
@@ -4095,7 +4134,7 @@ class Session:
             log.debug("heartbeat send failed: %s", e)
 
     def _send_rr_and_maybe_sr(self) -> None:
-        sock = self._sock_ctrl
+        sock, port = self._video_rtcp_dest()
         enc = self._srtcp_enc
         sender_ssrc = self._our_video_ssrc
         if sock is None or enc is None or sender_ssrc is None:
@@ -4114,9 +4153,29 @@ class Session:
             rr = build_empty_sr(sender_ssrc) + rr
 
         try:
-            sock.sendto(enc.protect(rr), (self._dest_host, self._ctrl_dest_port))
+            sock.sendto(enc.protect(rr), (self._dest_host, port))
         except OSError as e:
             log.debug("RR/SR send failed: %s", e)
+        if self._tx_tick % 2 == 0:
+            self._send_audio_rr()
+
+    def _send_audio_rr(self) -> None:
+        """Receiver report on the audio leg (UDP 5900) about once a second,
+        from our audio SSRC under the audio viewer-to-server SRTCP key, as
+        Apple's viewer sends on both legs. Keeps the host's audio stream from
+        logging an RTCP timeout every second."""
+        sock, enc, ssrc = self._sock_ctrl, self._audio_srtcp_enc, self._our_audio_ssrc
+        if sock is None or enc is None or ssrc is None:
+            return
+        src = self._audio_remote_ssrc
+        rr = build_rr(ssrc, source_ssrcs=[src] if src is not None else None,
+                      ssrc_stats={src: {"max_seq": self._audio_max_seq, "roc": 0}}
+                      if src is not None else None,
+                      sr_data=self._server_sr_audio)
+        try:
+            sock.sendto(enc.protect(rr), (self._dest_host, self._ctrl_dest_port))
+        except OSError as e:
+            log.debug("audio RR send failed: %s", e)
 
     def _drain_pending_fir(self) -> None:
         if self._decoder is None:
@@ -4213,7 +4272,7 @@ class Session:
         if now - last < self._FIR_MIN_INTERVAL_S:
             return False
         self._last_fir_per_tile[tile_idx] = now
-        sock = self._sock_ctrl
+        sock, port = self._video_rtcp_dest()
         enc = self._srtcp_enc
         if sock is None or enc is None:
             return False
@@ -4229,7 +4288,7 @@ class Session:
             + build_fir_legacy(target_ssrc),
         )
         try:
-            sock.sendto(enc.protect(compound), (self._dest_host, self._ctrl_dest_port))
+            sock.sendto(enc.protect(compound), (self._dest_host, port))
             if log_per_tile:
                 log.debug("FIR/PLI sent for tile %d (ssrc=0x%08x)", tile_idx, target_ssrc)
             if record_grayout:
@@ -4265,7 +4324,7 @@ class Session:
         self._last_concealment_msg = ""
 
     def _drain_pending_nack(self) -> None:
-        sock = self._sock_ctrl
+        sock, port = self._video_rtcp_dest()
         enc = self._srtcp_enc
         sender = self._our_video_ssrc
         if sock is None or enc is None or sender is None:
@@ -4279,7 +4338,7 @@ class Session:
                 continue
             compound = compound_with_rr(sender, nack)
             try:
-                sock.sendto(enc.protect(compound), (self._dest_host, self._ctrl_dest_port))
+                sock.sendto(enc.protect(compound), (self._dest_host, port))
             except OSError as e:
                 log.debug("NACK send failed: %s", e)
 
@@ -4513,6 +4572,16 @@ class Session:
     @property
     def _ctrl_dest_port(self) -> int:
         return self._config.udp_ctrl_port or self._config.port
+
+    def _video_rtcp_dest(self):
+        """(socket, port) for video-leg RTCP (RR, FIR/PLI, NACK): the video
+        port, where the host's video stream takes its RTCP. Each leg has its
+        own SRTCP keys; video RTCP sent to the audio port (the old behaviour,
+        ISS_VIDEO_RTCP_ON_CTRL=1) can't be authenticated by the audio leg,
+        which then logs that it never receives RTCP."""
+        if os.environ.get("ISS_VIDEO_RTCP_ON_CTRL") == "1":
+            return self._sock_ctrl, self._ctrl_dest_port
+        return self._sock_video, self._video_dest_port
 
     @property
     def _video_dest_port(self) -> int:
