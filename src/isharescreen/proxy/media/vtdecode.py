@@ -59,6 +59,45 @@ def available() -> bool:
     return _VT_OK
 
 
+_hw444_cache: dict[str, Optional[bool]] = {}
+
+
+def hevc444_hw_supported() -> Optional[bool]:
+    """Whether VideoToolbox can decode HEVC 4:4:4 in HARDWARE on this Mac.
+
+    Opens a decompression session for the embedded 4:4:4 probe clip's
+    parameter sets with RequireHardwareAcceleratedVideoDecoder. Apple silicon
+    has a hardware 4:4:4 decoder; Intel Macs generally don't (a 2015 MacBook
+    Pro has no HEVC hardware at all), and there VideoToolbox would silently
+    decode the stream in software, too slow for a live 4-tile 4:4:4 stream.
+    Returns True/False, or None if the check itself failed (caller keeps its
+    previous assumption). Cached for the process lifetime."""
+    if "hw" in _hw444_cache:
+        return _hw444_cache["hw"]
+    result: Optional[bool] = None
+    if _VT_OK:
+        try:
+            from .hwcaps import _HEVC444_SAMPLE
+            nals = [n for n in _HEVC444_SAMPLE.split(b"\x00\x00\x00\x01") if n]
+            psets = tuple(n for n in nals if ((n[0] >> 1) & 0x3F) in (32, 33, 34))
+            st, fmt = _CM.CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+                None, len(psets), psets, tuple(len(p) for p in psets), 4, None, None)
+            if st == 0 and fmt is not None:
+                spec = {_VT.kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder: True}
+                st, session = _VT.VTDecompressionSessionCreate(
+                    None, fmt, spec, None, None, None)
+                result = st == 0 and session is not None
+                if session is not None:
+                    _VT.VTDecompressionSessionInvalidate(session)
+                log.info("VideoToolbox HEVC 4:4:4 hardware decode: %s (status %d)",
+                         "yes" if result else "no", st)
+        except Exception as e:
+            log.info("VideoToolbox HEVC 4:4:4 hardware check failed: %s", e)
+            result = None
+    _hw444_cache["hw"] = result
+    return result
+
+
 @dataclass(slots=True)
 class _VTSlot:
     """Latest decoded `TileFrame` for one tile + a monotonic sequence so an

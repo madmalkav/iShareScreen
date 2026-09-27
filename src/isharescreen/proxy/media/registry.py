@@ -43,6 +43,11 @@ class DecoderSpec:
     available: Callable[[], bool]   # runtime probe (cheap; hwcaps caches)
     build: Callable[..., object]    # factory(num_tiles, **opts) -> decoder
     note: str = ""
+    # For kind="hardware": whether it really decodes in hardware on THIS
+    # machine (None = always). A spec can be usable (available) yet fall back
+    # to software inside the OS decoder, e.g. VideoToolbox HEVC 4:4:4 on Intel
+    # Macs; such a spec must not make --codec auto pick HEVC.
+    hardware: Optional[Callable[[], bool]] = None
 
     def supported_here(self) -> bool:
         return "*" in self.platforms or sys.platform in self.platforms
@@ -54,6 +59,17 @@ def _hevc444_method() -> Optional[str]:
     """'qsv' | 'libav' | None — how HEVC 4:4:4 can be HW-decoded here."""
     from .hwcaps import hevc444_decode_method
     return hevc444_decode_method()
+
+
+def _vt_hw444() -> bool:
+    """VideoToolbox decodes HEVC 4:4:4 in hardware here (Apple silicon), or
+    the check couldn't run (keep the old assumption)."""
+    try:
+        from .vtdecode import hevc444_hw_supported
+        return hevc444_hw_supported() is not False
+    except Exception as e:  # pragma: no cover
+        log.debug("vt hardware check failed: %s", e)
+        return True
 
 
 def _vt_available() -> bool:
@@ -129,6 +145,7 @@ def _build_avc(num_tiles, *, enable_quality_gate=True, on_frame_published=None,
 _REGISTRY: list[DecoderSpec] = [
     DecoderSpec("vt-hevc444", "hevc", "444", ("darwin",), "hardware", 100,
                 available=lambda: _vt_available(), build=_build_vt,
+                hardware=lambda: _vt_hw444(),
                 note="direct VideoToolbox (VTDecompressionSession, no libav RPS layer)"),
     DecoderSpec("libav-hevc444", "hevc", "444", ("*",), "hardware", 60,
                 available=lambda: _hevc444_method() == "libav", build=_build_libav_hevc,
@@ -188,7 +205,8 @@ def can_decode(codec: str, chroma: str, *, hardware_only: bool = False) -> bool:
     negotiation. Pass hardware_only=True to exclude software decoders."""
     specs = candidates(codec, chroma)
     if hardware_only:
-        specs = [s for s in specs if s.kind == "hardware"]
+        specs = [s for s in specs if s.kind == "hardware"
+                 and (s.hardware is None or s.available() and s.hardware())]
     return any(s.available() for s in specs)
 
 
