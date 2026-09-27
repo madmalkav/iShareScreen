@@ -552,6 +552,17 @@ def _run_frontend(config: SessionConfig, args: argparse.Namespace) -> int:
 
 # ── entry point ──────────────────────────────────────────────────────
 
+def _caused_by_interrupt(e: BaseException) -> bool:
+    """True if a KeyboardInterrupt is anywhere in `e`'s cause/context chain."""
+    seen = set()
+    while e is not None and id(e) not in seen:
+        if isinstance(e, KeyboardInterrupt):
+            return True
+        seen.add(id(e))
+        e = e.__cause__ or e.__context__
+    return False
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     args = _make_parser().parse_args(argv)
     _setup_logging(args)
@@ -601,6 +612,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         log.info("interrupted")
         return 130
     except Exception as e:
+        if _caused_by_interrupt(e):
+            # Ctrl-C landing inside library internals can surface as another
+            # exception (e.g. threading's "release unlocked lock").
+            log.info("interrupted")
+            return 130
         # Bad credentials are a user error, not a bug — clean message,
         # no traceback even in --verbose, distinct exit code.
         from isharescreen.proxy.protocol.auth import AuthError

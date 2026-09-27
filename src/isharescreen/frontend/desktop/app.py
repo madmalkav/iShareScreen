@@ -11,6 +11,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import os
+import signal
 import threading
 import time
 from typing import Optional
@@ -1315,7 +1316,27 @@ def run(
                 log.error("send_dynamic_resolution failed: %s", e)
                 return
 
-    while time.monotonic() < deadline:
+    # Ctrl-C: the first one asks the loop to stop so the normal cleanup below
+    # runs (session.close() tells the Mac, audio/keyboard grab/window are
+    # released). Raising KeyboardInterrupt instead can land inside
+    # threading.Event.wait() while it re-acquires its internal lock, which
+    # then fails with "RuntimeError: release unlocked lock" and skips all of
+    # that cleanup. A second Ctrl-C raises as before (escape hatch).
+    _stop_requested = threading.Event()
+    _prev_sigint = None
+
+    def _on_sigint(signum, frame):
+        if _stop_requested.is_set():
+            raise KeyboardInterrupt
+        _stop_requested.set()
+        log.info("Ctrl-C: closing the session (press again to force quit)")
+
+    try:
+        _prev_sigint = signal.signal(signal.SIGINT, _on_sigint)
+    except ValueError:            # not the main thread: keep the default
+        _prev_sigint = None
+
+    while time.monotonic() < deadline and not _stop_requested.is_set():
         glfw.poll_events()
         _apply_pending_cursor()
         # Hide the local OS cursor only once the overlay can actually draw —
@@ -1460,6 +1481,8 @@ def run(
             _cursor_dirty["v"] = False
 
     log.info("desktop frontend closing")
+    if _prev_sigint is not None:
+        signal.signal(signal.SIGINT, _prev_sigint)
     for sv in secondaries:
         try:
             sv.window.close()
