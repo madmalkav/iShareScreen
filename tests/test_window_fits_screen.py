@@ -79,3 +79,37 @@ def test_real_wayland_usable_area_is_logical_and_within_output():
     sx, sy = glfw.get_monitor_content_scale(mon)
     logical = (round(vm.size.width / sx), round(vm.size.height / sy))
     assert 0 < area[0] <= logical[0] and 0 < area[1] < logical[1]  # title bar at least
+
+
+def test_lock_aspect_inscribes_the_size_from_before_the_lock(monkeypatch):
+    """GLFW/Wayland shrinks a near-aspect window's height by the ratio when
+    the aspect is set (1870x1052 @ 1920:1080 -> 1870x591); ignore that."""
+    size = {"v": (1870, 1052)}
+    monkeypatch.setattr(glfw, "get_window_size", lambda w: size["v"])
+    monkeypatch.setattr(glfw, "set_window_aspect_ratio",
+                        lambda w, n, d: size.update(v=(1870, 591)))
+    monkeypatch.setattr(glfw, "set_window_size", lambda w, a, b: size.update(v=(a, b)))
+    canvas_mod.lock_aspect(object(), 1920, 1080)
+    assert size["v"] == (1870, 1051)
+
+
+@pytest.mark.skipif(not os.environ.get("WAYLAND_DISPLAY"),
+                    reason="needs a Wayland session")
+def test_real_wayland_fitted_window_survives_aspect_lock():
+    import time
+    from isharescreen.frontend.desktop.canvas import WaylandSafeCanvas
+    try:
+        c = WaylandSafeCanvas(title="iss fit test", size=(1870, 1052))
+    except Exception as e:  # pragma: no cover
+        pytest.skip(f"cannot open a window: {e}")
+    try:
+        if not canvas_mod._on_wayland():
+            pytest.skip("GLFW is not using the Wayland platform")
+        canvas_mod.lock_aspect(c._window, 1920, 1080)
+        for _ in range(10):
+            glfw.poll_events()
+            time.sleep(0.03)
+        w, h = glfw.get_window_size(c._window)
+        assert w >= 1860 and h >= 1045, (w, h)
+    finally:
+        c.close()

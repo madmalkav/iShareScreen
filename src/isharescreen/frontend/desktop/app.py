@@ -21,7 +21,7 @@ import wgpu
 from ...proxy.protocol.negotiation import AdvertiseDims
 from ...proxy.session import Session, SessionConfig
 from .audio_sink import make_audio_sink
-from .canvas import WaylandSafeCanvas, fit_size, fit_window_to_screen, usable_screen_area
+from .canvas import WaylandSafeCanvas, fit_size, fit_window_to_screen, lock_aspect, usable_screen_area
 from .gpu import Renderer
 from .keymap import GLFW_KEY_TO_X11, glfw_button_to_rfb_bit
 
@@ -397,12 +397,7 @@ def run(
     # freely reshaping the window (the whole point of "track window size").
     if not dynamic:
         try:
-            glfw.set_window_aspect_ratio(glfw_window, win_w, win_h)
-            _cw0, _ch0 = glfw.get_window_size(glfw_window)
-            if _cw0 > 0 and _ch0 > 0:
-                _f = min(_cw0 / win_w, _ch0 / win_h)
-                glfw.set_window_size(
-                    glfw_window, max(1, int(win_w * _f)), max(1, int(win_h * _f)))
+            lock_aspect(glfw_window, win_w, win_h)
         except Exception as _e:
             log.debug("window aspect-lock failed: %s", _e)
     fit_window_to_screen(glfw_window)
@@ -761,7 +756,7 @@ def run(
         w2 = WaylandSafeCanvas(title=title_s, size=(win_w2, win_h2), max_fps=120)
         gw2 = w2._window
         try:
-            glfw.set_window_aspect_ratio(gw2, rw0, rh0)
+            lock_aspect(gw2, rw0, rh0)
         except Exception:
             pass
         fit_window_to_screen(gw2)
@@ -964,13 +959,7 @@ def run(
                 if abs(_asp - _locked_aspect[0]) > 0.01:
                     _locked_aspect[0] = _asp
                     try:
-                        glfw.set_window_aspect_ratio(glfw_window, _ccw, _cch)
-                        _gw, _gh = glfw.get_window_size(glfw_window)
-                        if _gw > 0 and _gh > 0:
-                            _ff = min(_gw / _ccw, _gh / _cch)
-                            glfw.set_window_size(
-                                glfw_window, max(1, int(_ccw * _ff)),
-                                max(1, int(_cch * _ff)))
+                        lock_aspect(glfw_window, _ccw, _cch)
                     except Exception:
                         pass
             if _canvas_cursor:

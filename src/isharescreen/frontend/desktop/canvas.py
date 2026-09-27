@@ -90,6 +90,10 @@ def usable_screen_area(glfw_window=None) -> Optional[tuple[int, int]]:
     monitor work area minus the window's frame (title bar/borders), which GLFW
     reports on Windows, macOS and X11 once a window exists.
     """
+    try:
+        glfw.init()  # idempotent; _on_wayland() needs the platform chosen
+    except Exception:
+        return None
     if _on_wayland():
         return _wayland_usable_area()
     try:
@@ -116,6 +120,23 @@ def fit_size(size: tuple[int, int], area: Optional[tuple[int, int]]) -> tuple[in
     return (max(1, int(w * f)), max(1, int(h * f)))
 
 
+def lock_aspect(glfw_window, num: int, den: int) -> None:
+    """Lock the window to num:den and inscribe its current size to that aspect.
+
+    Inscribes the size from BEFORE the lock: GLFW's Wayland backend resizes
+    the window itself when its shape is a hair off the ratio, dividing the
+    height by the ratio (1870x1052 locked to 1920:1080 became 1870x591), so
+    the size read afterwards can be wrong.
+    """
+    if num <= 0 or den <= 0:
+        return
+    cw, ch = glfw.get_window_size(glfw_window)
+    glfw.set_window_aspect_ratio(glfw_window, num, den)
+    if cw > 0 and ch > 0:
+        f = min(cw / num, ch / den)
+        glfw.set_window_size(glfw_window, max(1, int(num * f)), max(1, int(den * f)))
+
+
 def fit_window_to_screen(glfw_window) -> None:
     """Shrink an open window (keeping its aspect) so it and its title bar fit
     the usable screen area. No-op when it already fits or the area is unknown."""
@@ -130,4 +151,4 @@ def fit_window_to_screen(glfw_window) -> None:
         log.debug("fit window to screen failed: %s", e)
 
 
-__all__ = ["WaylandSafeCanvas", "fit_size", "fit_window_to_screen", "usable_screen_area"]
+__all__ = ["WaylandSafeCanvas", "fit_size", "fit_window_to_screen", "lock_aspect", "usable_screen_area"]
