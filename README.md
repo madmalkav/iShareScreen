@@ -183,7 +183,7 @@ Normally `auto`. Pinning one is mostly for debugging:
 | your machine | recommended | notes |
 |---|---|---|
 | Apple silicon Mac | defaults (HEVC, VideoToolbox) | |
-| Intel Mac | defaults (H.264) | Most Intel Macs can't decode HEVC 4:4:4 in hardware, so auto picks H.264 (it asks VideoToolbox for a hardware 4:4:4 decoder at startup). On a 2015 MacBook Pro, HEVC ran at ~28 fps with gray patches, while H.264 ran at ~60 fps (in software there, as VideoToolbox H.264 failed to start at that size). |
+| Intel Mac | defaults (H.264) | Most Intel Macs can't decode HEVC 4:4:4 in hardware, so auto picks H.264 (it asks VideoToolbox for a hardware 4:4:4 decoder at startup). On a 2015 MacBook Pro, HEVC ran at ~28 fps with gray patches, while H.264 ran at ~60 fps (in software there: Apple's H.264 stream declares 15 reference frames and this Mac's hardware H.264 decoder accepts at most 10, so VideoToolbox refuses it). |
 | Linux/Windows, NVIDIA RTX 20 or newer | defaults (HEVC, CUDA/VAAPI or D3D11VA) | Tested on an RTX 2080: 4K and 5120×2160 at ~60–70 fps with a fraction of a CPU core. |
 | NVIDIA GTX 10 or older | defaults (H.264) | These can't decode HEVC 4:4:4. At 4K, H.264 through NVIDIA's VA driver is slower than software (each frame is copied back from the GPU), so iss switches to software when it measures that. |
 | Intel 11th gen or newer | defaults | Should get HEVC 4:4:4 in hardware via VAAPI or Quick Sync (untested here). |
