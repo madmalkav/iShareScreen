@@ -184,11 +184,13 @@ def build_0x1c(
     config_flags = 3
     if alt_session:
         config_flags = (config_flags & ~2) | 4   # drop bit 1, set bit 2
-    elif os.environ.get("ISS_LEGACY_CURSOR") != "1":
+    elif (os.environ.get("ISS_LEGACY_CURSOR") != "1"
+          and os.environ.get("ISS_VIDEO_CURSOR") != "1"):
         # Strip system cursor from the encoded frames. Saves ~0.5-1 Mbps
         # of cursor-motion bandwidth, and the cursor pseudo-encoding
         # pipeline (RFB enc 1104) sends shape updates to the local OS
         # cursor instead. Set ISS_LEGACY_CURSOR=1 to disable and revert
+        # (--cursor video sets ISS_VIDEO_CURSOR=1 for the same effect)
         # to the old "cursor baked into framebuffer" behaviour.
         config_flags |= 4
     # BIG-endian u32. DO NOT "correct" this to little-endian on the strength of

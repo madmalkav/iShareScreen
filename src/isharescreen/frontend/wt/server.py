@@ -971,8 +971,13 @@ class WebTransportBridge:
         if loop is None or img is None or not getattr(img, "rgba", None):
             return
         try:
-            env = _cursor_envelope(img.width, img.height,
-                                   img.hotspot_x, img.hotspot_y, img.rgba)
+            if os.environ.get("ISS_VIDEO_CURSOR") == "1":
+                # --cursor video: the host draws the cursor into the video, so
+                # hide the page's CSS cursor (an empty cursor = "none").
+                env = _cursor_envelope(0, 0, 0, 0, b"")
+            else:
+                env = _cursor_envelope(img.width, img.height,
+                                       img.hotspot_x, img.hotspot_y, img.rgba)
         except Exception:
             return
         self._broadcast_frame(env)

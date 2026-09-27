@@ -331,10 +331,17 @@ def run(
     # sits on top of it, so you see one crisp cursor — a faint baked ghost
     # may trail it only during fast motion. ISS_LOCAL_CURSOR=1 reverts to the
     # legacy behaviour (reshape the local OS cursor; no overlay).
-    _canvas_cursor = os.environ.get("ISS_LOCAL_CURSOR") != "1"
+    # --cursor video (ISS_VIDEO_CURSOR=1): the host draws the cursor into the
+    # video (0x1c bit 0x04 left clear) at the stream's full resolution, so no
+    # overlay and the local pointer stays hidden over the window.
+    _video_cursor = os.environ.get("ISS_VIDEO_CURSOR") == "1"
+    _canvas_cursor = (os.environ.get("ISS_LOCAL_CURSOR") != "1"
+                      and not _video_cursor)
     _last_cursor_img: dict[str, object] = {"img": None}
 
     def _on_cursor(img):
+        if _video_cursor:
+            return
         if _canvas_cursor:
             # Defer to the render thread — the overlay texture upload has to
             # run on the thread that owns the wgpu device.
@@ -404,6 +411,12 @@ def run(
         except Exception as _e:
             log.debug("window aspect-lock failed: %s", _e)
     fit_window_to_screen(glfw_window)
+    if _video_cursor:
+        try:
+            glfw.set_input_mode(glfw_window, glfw.CURSOR, glfw.CURSOR_HIDDEN)
+        except Exception as e:
+            log.debug("could not hide local cursor: %s", e)
+        log.info("cursor: drawn by the host into the video (--cursor video)")
     # In canvas-cursor mode we render the host's cursor as a wgpu overlay and
     # hide the local system pointer — but NOT yet. Hiding it now, before the
     # overlay has both a shape (a cursor pixmap arrived) and a position (the

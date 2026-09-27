@@ -281,6 +281,8 @@ def _launch(values: dict) -> None:
             cmd += ["--advertise", advertise]
     else:
         cmd += ["--hidpi", scale]
+    if values.get("cursor", "overlay").strip() == "video":
+        cmd += ["--cursor", "video"]
     decoder = values.get("decoder", "auto").strip()
     if decoder and decoder != "auto":
         cmd += ["--decoder", decoder]        # explicit pin — session honours it
@@ -410,6 +412,11 @@ _FORM = """<!doctype html><html><head><title>iShareScreen — Connect</title>__H
   <label>Decoder</label>
   <select name="decoder" title="Only decoders available on this computer are listed. 'Auto' picks the best one; the rest are for pinning a specific path when debugging.">
    __DECODER_OPTIONS__
+  </select>
+  <label>Cursor</label>
+  <select name="cursor" title="Separate: the Mac sends the pointer shape and it is drawn at your local pointer — most responsive. In video: the Mac draws the pointer into the video — sharp on HiDPI and hidden during full-screen video, but it moves with the video stream.">
+   <option value="overlay">Separate (most responsive)</option>
+   <option value="video">In video (sharp, hides in full-screen video)</option>
   </select>
   <div class="row"><input type="checkbox" name="audio" id="audio" checked><label for="audio" style="margin:0">Audio</label></div>
   <div class="row"><input type="checkbox" name="curtain" id="curtain" checked><label for="curtain" style="margin:0">Curtain (private virtual display)</label></div>

@@ -189,6 +189,18 @@ def _make_parser() -> argparse.ArgumentParser:
         ),
     )
     g.add_argument(
+        "--cursor", choices=["overlay", "video"], default="overlay",
+        help=(
+            "how the Mac's pointer is shown. 'overlay' (default): the host "
+            "sends the cursor shape separately and iss draws it at the local "
+            "pointer position — most responsive. 'video': the host draws the "
+            "cursor into the video at full resolution — sharp on HiDPI and "
+            "hidden when macOS hides it (e.g. full-screen video), but it "
+            "moves with the video stream, so it lags or freezes if the "
+            "stream does"
+        ),
+    )
+    g.add_argument(
         "--list-decoders", action="store_true",
         help=("print the decoder capability matrix (with live availability on "
               "this machine) and exit"),
@@ -535,6 +547,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         _os.environ["ISS_DECODER"] = args.decoder
     if args.codec and args.codec != "auto":
         os.environ["ISS_VIDEO_CODEC"] = args.codec
+    if getattr(args, "cursor", "overlay") == "video":
+        os.environ["ISS_VIDEO_CURSOR"] = "1"
     signal.signal(signal.SIGINT, signal.default_int_handler)
 
     # Surface tracebacks for any thread that crashes — without this,
