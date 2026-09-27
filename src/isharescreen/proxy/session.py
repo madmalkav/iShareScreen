@@ -92,6 +92,14 @@ _TX_INTERVAL_S = 0.5
 _SSRC_LIVE_S = 0.5
 
 
+def _is_rtcp(pkt: bytes) -> bool:
+    """RTP/RTCP demultiplexing on a muxed port (RFC 5761 §4): an RTCP packet's
+    second byte is its full packet type, 192-223 (the host sends SR 200 etc.).
+    RTP's second byte is marker bit + payload type, so masking it with 0x7F
+    (as an RTP check does) turns SR 200 into 72 and misses every RTCP packet."""
+    return len(pkt) >= 2 and (pkt[0] & 0xC0) == 0x80 and 192 <= pkt[1] <= 223
+
+
 def _rctl_enabled() -> bool:
     """RCTL rate-control reports are on by default; ISS_RCTL=0 turns them off
     (the host then stays at its 20 Mbit/s floor, the old behaviour)."""
@@ -2408,8 +2416,7 @@ class Session:
                 self._evict_stale_groups()
                 continue
 
-            if (len(pkt) >= 2 and (pkt[0] & 0xC0) == 0x80
-                    and 200 <= (pkt[1] & 0x7F) <= 207):
+            if _is_rtcp(pkt):
                 self._handle_video_rtcp(pkt)       # SRTCP muxed on the video leg
                 continue
             res = decryptor.decrypt(pkt)
@@ -3121,7 +3128,7 @@ class Session:
             if (
                 len(pkt) >= 2
                 and (pkt[0] & 0xC0) == 0x80
-                and not (200 <= (pkt[1] & 0x7F) <= 207)
+                and not _is_rtcp(pkt)
             ):
                 self._handle_audio_rtp(pkt)
                 continue
