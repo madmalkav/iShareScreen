@@ -106,6 +106,15 @@ _QUEUE_MAX = 512                           # NALUs in flight to the decoder
 _QUEUE_RESYNC_AT = _QUEUE_MAX // 2
 # Don't resync again before the requested keyframe has had time to land.
 _RESYNC_MIN_INTERVAL_S = 1.0
+# Startup hold. Right after the decoder is (re)built — session start and each
+# SSRC switch the host does ~2 s in — tiles 1-3 decode P-frames against
+# references libav had to invent (flat gray; no per-frame error flag), so the
+# viewer opened on 2-4 s of gray strips. Until a tile has shown a frame since
+# the (re)build, don't show it while the gate still wants a keyframe for it:
+# the tile stays black at session start, or keeps its last picture after a
+# switch. Mid-session the existing "show the artifact, FIR in the background"
+# policy is unchanged, and the hold ends after this many seconds regardless.
+_STARTUP_HOLD_S = 6.0
 _WORKER_DEQUEUE_TIMEOUT_S = 0.5
 
 # Keep hardware-decoded frames on the GPU and download them lazily in
@@ -322,6 +331,9 @@ class HevcDecoder:
         self._resync_pending = False
         self._last_resync_t = 0.0
         self._overload_resyncs: int = 0
+        # Startup hold (see `_STARTUP_HOLD_S`), reset by `_install_codec`.
+        self._codec_built_t = 0.0
+        self._tiles_shown: set[int] = set()
 
         # PTS bookkeeping. Only the active decoder thread (sync mode = main
         # caller; async mode = worker) reads/writes these.
@@ -613,7 +625,21 @@ class HevcDecoder:
             self._gate.mark_clean(tile_idx)
         if not self._gate.should_publish(tile_idx, tile_frame):
             return None
+        if self._startup_hold(tile_idx):
+            return None
+        self.__dict__.setdefault("_tiles_shown", set()).add(tile_idx)
         return tile_frame
+
+    def _startup_hold(self, tile_idx: int) -> bool:
+        """True while a tile that hasn't been shown since the decoder was
+        (re)built still needs a keyframe (see `_STARTUP_HOLD_S`)."""
+        if tile_idx in getattr(self, "_tiles_shown", ()):
+            return False
+        if tile_idx not in self._gate.bad_tiles:
+            return False
+        import time as _time
+        built = getattr(self, "_codec_built_t", 0.0)
+        return _time.monotonic() - built < _STARTUP_HOLD_S
 
     def consume_fir_request(self) -> set[int]:
         """Tile indices needing a fresh IDR. Read + cleared each call."""
@@ -1256,6 +1282,9 @@ class HevcDecoder:
     ) -> None:
         self._codec = codec
         self._hw_name = hw_name
+        import time as _time
+        self._codec_built_t = _time.monotonic()
+        self._tiles_shown = set()
         # _try_hwaccel labels the context with the REQUESTED hwaccel, but the
         # accel only binds in get_format. e.g. DXVA2/D3D11VA are never offered
         # for HEVC 4:4:4, so on Windows Apple's stream silently decodes in
