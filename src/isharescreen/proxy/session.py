@@ -107,6 +107,16 @@ _MEDIA_SILENCE_WARN_S = 10.0
 _MEDIA_SILENCE_END_S = 48.0
 
 
+# H.264 receive backlog guard (Session._maybe_shed_backlog): drop the queue
+# when packets wait longer than this before being processed; at most once per
+# cooldown. The delay a drop reveals keeps being reported (decaying linearly
+# over _CONGESTION_HOLD_S) so the host's rate controller backs off.
+_BACKLOG_MAX_DELAY_S = 0.5
+_BACKLOG_COOLDOWN_S = 2.0
+_BACKLOG_MIN_PKTS = 200
+_CONGESTION_HOLD_S = 10.0
+
+
 def _rctl_enabled() -> bool:
     """RCTL rate-control reports are on by default; ISS_RCTL=0 turns them off
     (the host then stays at its 20 Mbit/s floor, the old behaviour)."""
@@ -414,6 +424,17 @@ class Session:
         # process loop and read by the iss-rctl thread.
         self._rctl = RctlState()
         self._rctl_lock = threading.Lock()
+        # Receive backlog guard (_maybe_shed_backlog) and the one-way RCTL
+        # stop it can trigger.
+        self._last_backlog_shed_t: float = 0.0
+        self._backlog_sheds: int = 0
+        # Congestion revealed by a backlog drop, reported in RCTL and decaying
+        # over _CONGESTION_HOLD_S (see _maybe_shed_backlog, _rctl_loop).
+        self._congestion_delay_s: float = 0.0
+        self._congestion_t: float = 0.0
+        self._pps: float = 0.0
+        self._pps_t0: float = 0.0
+        self._pps_count: int = 0
         self._last_profile_shown: list[int] = []
 
         # Cipher state for the TX channel.
@@ -1760,6 +1781,75 @@ class Session:
             t.start()
             self._threads.append(t)
 
+    # ── receive backlog guard (H.264) ────────────────────────────────
+
+    def _maybe_shed_backlog(self) -> None:
+        """Bound the latency when the viewer can't keep up (H.264 path).
+
+        The H.264 decoder runs on the video process thread, so a decoder
+        slower than the stream lets the UDP queue grow without limit: seconds
+        of lag on a weak CPU (a 2-core Intel Mac ran 3-4 s behind). The RCTL
+        delay estimate measures exactly that wait (arrival is stamped when a
+        packet is taken off the queue). Above _BACKLOG_MAX_DELAY_S, drop the
+        queued packets, re-root the decoder on the next intra frame and ask
+        for one. The HEVC path has its own decode-queue resync. If this fires
+        repeatedly while RCTL is on, the viewer can't keep up even at the
+        host's minimum bitrate, so stop the rate reports (see _rctl_loop)."""
+        now = time.monotonic()
+        # Packet rate over ~1 s windows, to turn "half a second" into packets.
+        self._pps_count += 1
+        if now - self._pps_t0 >= 1.0:
+            self._pps = self._pps_count / (now - self._pps_t0)
+            self._pps_t0, self._pps_count = now, 0
+        if now - self._last_backlog_shed_t < _BACKLOG_COOLDOWN_S:
+            return
+        with self._rctl_lock:
+            delay = self._rctl.delay_s
+        if delay < _BACKLOG_MAX_DELAY_S:
+            return
+        # The delay estimate alone is jumpy (it includes the host's own
+        # burstiness, e.g. a keyframe); only a real queue of that much
+        # stream is a backlog worth dropping.
+        if self._video_q.qsize() < max(_BACKLOG_MIN_PKTS, _BACKLOG_MAX_DELAY_S * self._pps):
+            return
+        dropped = 0
+        q = self._video_q
+        while True:
+            try:
+                q.get_nowait()
+                dropped += 1
+            except queue.Empty:
+                break
+        self._pending_groups.clear()
+        self._last_backlog_shed_t = now
+        self._backlog_sheds += 1
+        with self._rctl_lock:
+            self._rctl.reset(None)
+        dec = self._decoder
+        if dec is not None and hasattr(dec, "mark_reference_chain_broken"):
+            dec.mark_reference_chain_broken("receive backlog dropped")
+        self.request_fir()
+        log.warning("decoder can't keep up: %.1f s behind; dropped %d queued "
+                    "packets and asked for a keyframe (#%d)",
+                    delay, dropped, self._backlog_sheds)
+        # Keep telling the host about the congestion the drop just hid: the
+        # estimate restarts from the fresh packets, so without this the next
+        # reports claim ~0 delay and the host ramps straight back up. (Just
+        # stopping RCTL is worse: the host then freezes at its last target.)
+        self._congestion_delay_s = max(self._congestion_delay_s, delay)
+        self._congestion_t = now
+
+    def _held_congestion(self, now: float) -> float:
+        """The delay revealed by the last backlog drop, fading to 0 over
+        _CONGESTION_HOLD_S."""
+        if self._congestion_delay_s <= 0.0:
+            return 0.0
+        left = 1.0 - (now - self._congestion_t) / _CONGESTION_HOLD_S
+        if left <= 0.0:
+            self._congestion_delay_s = 0.0
+            return 0.0
+        return self._congestion_delay_s * left
+
     # ── rate-control reports (RCTL) ──────────────────────────────────
 
     def _rctl_loop(self) -> None:
@@ -1781,7 +1871,8 @@ class Session:
                 pkt = build_rctl(
                     ssrc, echo_ts=st.last_ts,
                     hold_ms=(now - st.last_arrival) * 1000, clock_s=now,
-                    delay_s=st.delay_s, received=st.received, bwe_kbps=bwe)
+                    delay_s=max(st.delay_s, self._held_congestion(now)),
+                    received=st.received, bwe_kbps=bwe)
                 delay_ms = st.delay_s * 1000
             try:
                 sock.sendto(enc.protect(pkt), (self._dest_host, self._video_dest_port))
@@ -2452,6 +2543,8 @@ class Session:
                 with self._rctl_lock:
                     self._rctl.on_packet(ssrc, tile, ts, time.monotonic())
             self._queue_video_group_packet(ssrc, ts, seq, marker, payload)
+            if self._video_codec == "avc":
+                self._maybe_shed_backlog()
 
             # Expire repair/no-marker holes even while the queue stays busy.
             # Previously eviction ran only on queue.Empty, which may never
