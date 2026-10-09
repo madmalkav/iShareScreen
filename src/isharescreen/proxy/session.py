@@ -231,6 +231,21 @@ class _CursorImage:
     rgba: bytes
 
 
+# Re-offer timing (seconds) after the Mac's message 1, and the fallback after
+# a geometry change that brings no message 1.
+_REOFFER_SETTLE_S = 0.3
+_REOFFER_FALLBACK_S = 1.0
+# A burst-drain read that waited this long means the socket's backlog is
+# drained (buffered packets come back in microseconds).
+_BURST_CAUGHT_UP_S = 0.008
+
+
+def _reoffer_on_message1() -> bool:
+    """Re-offer on the Mac's message 1 (default). ISS_REOFFER_ON_MSG1=0
+    restores the old trigger: an immediate re-offer on a geometry change only."""
+    return os.environ.get("ISS_REOFFER_ON_MSG1", "1") != "0"
+
+
 @dataclass
 class SessionConfig:
     """Connection parameters. Defaults are conservative; the CLI
@@ -373,6 +388,11 @@ class Session:
         # see the property `display_rects`. Also reset in `_teardown`.
         self._display_rects: list[DisplayRect] = []
         self._needs_post_layout_fir: bool = False
+        # Mid-session 0x1c re-offer, debounced: one offer per burst of the
+        # Mac's message 1 / layout events (see `_request_reoffer`).
+        self._reoffer_timer: Optional[threading.Timer] = None
+        self._reoffer_lock = threading.Lock()
+        self._replaying_leftovers = False
         self._needs_param_harvest: bool = False
         # Cross-RTP-group accumulators for the post-resize param harvest.
         self._harvest_vps: Optional[bytes] = None
@@ -1506,12 +1526,14 @@ class Session:
         # are independent slice chains and the burst must gather enough to seed
         # the shared decoder context before the streaming loop starts.
         _is_avc = self._video_codec == "avc"
+        _min_pkts = 400 if _is_avc else 100
         self._drain_socket_into(
-            self._sock_video, burst_buf, max_seconds=4.0 if _is_avc else 2.0)
+            self._sock_video, burst_buf, max_seconds=4.0 if _is_avc else 2.0,
+            min_packets=0 if os.environ.get("ISS_OFFER_RESEND") == "1" else _min_pkts)
         return gather_initial_burst(
             burst_buf, self._video_decryptor, quality_tier=cfg.quality_tier,
             codec=self._video_codec,
-            min_packets=400 if _is_avc else 100,
+            min_packets=_min_pkts,
         )
 
     def _teardown_negotiation_tcp(self) -> None:
@@ -3216,10 +3238,16 @@ class Session:
         # arrived in the same chunk as the 0x1c answer). Without this
         # replay, the cursor pseudo-encoding cache starts empty and
         # subsequent cache-hit refs from the daemon all miss.
-        for msg in self._negotiation.leftover_msgs:
-            log.debug("dispatching leftover negotiation msg type=0x%02x len=%d",
-                      msg[0] if msg else 0, len(msg))
-            self._handle_tcp_msg(msg)
+        # A message 1 among them came before our offer and is already
+        # answered by it, so it must not trigger a re-offer.
+        self._replaying_leftovers = True
+        try:
+            for msg in self._negotiation.leftover_msgs:
+                log.debug("dispatching leftover negotiation msg type=0x%02x len=%d",
+                          msg[0] if msg else 0, len(msg))
+                self._handle_tcp_msg(msg)
+        finally:
+            self._replaying_leftovers = False
         self._negotiation.leftover_msgs.clear()
 
         while not self._stop_evt.is_set():
@@ -3391,6 +3419,21 @@ class Session:
                 sz = struct.unpack(">H", msg[offset:offset + 2])[0]
                 if offset + 2 + sz > len(msg):
                     return
+                if encoding == 1010:
+                    from .protocol.mediamsg import parse_body as _parse_media
+                    _m = _parse_media(bytes(msg[offset + 2:offset + 2 + sz]))
+                    if _m is not None:
+                        log.info("media stream: %s", _m.describe())
+                        # Message 1 (the ports) comes once per display
+                        # change, including ones that keep the geometry (a
+                        # display waking from sleep): the Mac has stopped
+                        # both legs and restarts them only for a new offer.
+                        if (_m.kind == 1 and not self._replaying_leftovers
+                                and _reoffer_on_message1()):
+                            self._request_reoffer(_REOFFER_SETTLE_S, "message 1")
+                        elif _m.kind == 3:
+                            log.warning("media stream: the Mac reported an error: %s",
+                                        _m.describe())
                 offset += 2 + sz
             elif encoding == 0x451:
                 # AppleDisplayLayout: server confirms/announces display
@@ -3541,7 +3584,13 @@ class Session:
                     # Geometry actually changed — additionally re-offer the
                     # media session (0x1c) so the encoder restarts at the new
                     # canvas. The FBUR it needs was just sent by the re-arm.
-                    self._schedule_post_layout_arm()
+                    # The Mac also sends a message 1 for the change, which
+                    # re-offers sooner; this is the fallback if it doesn't.
+                    if _reoffer_on_message1():
+                        self._request_reoffer(_REOFFER_FALLBACK_S, "layout change",
+                                              keep_pending=True)
+                    else:
+                        self._schedule_post_layout_arm()
                 offset += 2 + prefix_len
             else:
                 # A non-cursor, non-config rect on the control channel means
@@ -3580,6 +3629,33 @@ class Session:
                 self._input.request_framebuffer_update()
             except Exception:
                 pass
+
+    def _request_reoffer(self, delay_s: float, reason: str, *,
+                         keep_pending: bool = False) -> None:
+        """Re-offer the media session after `delay_s`, once. A later request
+        replaces a pending one (so a burst of layouts + message 1 yields one
+        offer), unless `keep_pending` and one is already scheduled."""
+        with self._reoffer_lock:
+            pending = self._reoffer_timer
+            if pending is not None and pending.is_alive():
+                if keep_pending:
+                    return
+                pending.cancel()
+
+            def _fire() -> None:
+                with self._reoffer_lock:
+                    if self._reoffer_timer is not timer:
+                        return
+                    self._reoffer_timer = None
+                if self._stop_evt.is_set():
+                    return
+                log.info("re-offering the media stream (%s)", reason)
+                self._schedule_post_layout_arm()
+
+            timer = threading.Timer(delay_s, _fire)
+            timer.daemon = True
+            self._reoffer_timer = timer
+            timer.start()
 
     def _schedule_post_layout_arm(self) -> None:
         """Called from the 0x451 handler on a geometry CHANGE. Re-offers the
@@ -4777,14 +4853,32 @@ class Session:
     @staticmethod
     def _drain_socket_into(
         sock: socket.socket, into: list[bytes], *, max_seconds: float,
+        min_packets: int = 0,
     ) -> None:
         """Pull packets off `sock` for up to `max_seconds`. Used to drain
-        the burst before the rx thread starts."""
+        the burst before the rx thread starts.
+
+        Once `min_packets` are in, stop as soon as the backlog is drained,
+        i.e. a read had to wait for the network: a continuous stream (one
+        offer, a playing video) never pauses for 50 ms, and draining it for
+        the full window only hands the decoder seconds of backlog to chew
+        through before it can go live."""
         deadline = time.monotonic() + max_seconds
         sock.settimeout(0.05)
+        caught_up = False
         while time.monotonic() < deadline:
+            t_read = time.monotonic()
             try:
                 pkt, _ = sock.recvfrom(65536)
+                if (min_packets and len(into) >= min_packets
+                        and time.monotonic() - t_read > _BURST_CAUGHT_UP_S):
+                    caught_up = True
+                # Stop on a picture boundary (RTP marker bit; not RTCP) so
+                # no access unit is split between the burst and the stream.
+                if (caught_up and len(pkt) >= 2 and pkt[1] & 0x80
+                        and not 192 <= pkt[1] <= 223):
+                    into.append(pkt)
+                    break
             except socket.timeout:
                 # Burst typically lands within 200-400 ms; once we see
                 # no packets for 50 ms after some have arrived, we have

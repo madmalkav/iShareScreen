@@ -37,7 +37,10 @@ from .apple import (
 )
 from .auth import AuthError, do_nonsrp_auth, do_srp_auth
 from .enc1103 import StreamCipher
-from .offers import create_offers, extract_canvas_dims
+from .mediamsg import (
+    fbu_layout_backing, iter_fbu_media_msgs, parse_body as parse_media_body,
+)
+from .offers import create_offers, extract_canvas_dims, tiles_per_frame
 from .rfb import (
     HP_ENCODINGS_FULL,
     build_post_encryption_toggle, build_set_encodings,
@@ -62,6 +65,10 @@ _POST_TOGGLE_SETTLE_S = 0.2
 # re-send the 0x1c on the same TCP rather than forcing a reconnect.
 _DEGENERATE_RETRY_INTERVAL_S = 0.2
 _DEGENERATE_RETRY_LIMIT = 16  # bumped to compensate for shorter interval
+# How long one offer waits for its answer (message 2 with a canvas) before
+# falling back to re-sending. The Mac answers in ~0.2 s; past ~1.5 s the 4 MB
+# video socket buffer can overflow at the start bitrate, so don't wait longer.
+_ANSWER_WAIT_S = 1.2
 
 
 # ── public data carriers ─────────────────────────────────────────────
@@ -538,7 +545,7 @@ def _phase_handshake_plaintext(
 
 def _phase_enable_enc1103(
     sock: socket.socket, ecb_key: bytes, *, first_byte_timeout: float = 10.0,
-) -> StreamCipher:
+) -> tuple[StreamCipher, list[bytes]]:
     """Drain framebuffer-update messages until we see the 1103 encoding entry,
     build a `StreamCipher` from its 36-byte body, then send the
     PostEncryptionToggle and drain pending traffic so the cipher's receive
@@ -546,8 +553,8 @@ def _phase_enable_enc1103(
     cipher = _read_until_enc1103(sock, ecb_key, first_byte_timeout=first_byte_timeout)
     sock.sendall(build_post_encryption_toggle())
     time.sleep(_POST_TOGGLE_SETTLE_S)
-    _drain_through_cipher(sock, cipher, timeout=0.5)
-    return cipher
+    drained = _drain_through_cipher(sock, cipher, timeout=0.5)
+    return cipher, drained
 
 
 # ── phase 4: encrypted media offer + answer ───────────────────────────
@@ -621,10 +628,14 @@ def _phase_media_offer(
     audio_offer: bytes, video_offer: bytes,
     *, alt_session: bool = False,
     leftover_msgs: Optional[list[bytes]] = None,
+    layout_backing: Optional[tuple[int, int]] = None,
 ) -> tuple[NegotiationKeys, tuple[int, int, int]]:
-    """Send the encrypted second SetEncodings + 0x1c, read the answer. On
-    degenerate canvas (encoder still warming up after an agent transition),
-    re-query up to `_DEGENERATE_RETRY_LIMIT` times. Returns (keys, canvas).
+    """Send the encrypted second SetEncodings + one 0x1c offer and wait for
+    its answer (message 2). The Mac's port announcement (message 1) has
+    already arrived by now, in the drain after the cipher starts. Only if no
+    usable answer comes within `_ANSWER_WAIT_S` does it fall back to
+    re-sending the offer up to `_DEGENERATE_RETRY_LIMIT` times (each re-send
+    makes the Mac start another stream). Returns (keys, canvas).
 
     Any decrypted msgs that aren't the 0x1c answer (typically the daemon's
     initial cursor pseudo-encoding rects, sent as soon as SetEncodings 1104
@@ -652,7 +663,17 @@ def _phase_media_offer(
         except OSError as e:
             log.warning("msg 0x03 send failed: %s", e)
 
-    canvas = _read_video_answer(sock, cipher, leftover_msgs)
+    # One offer, then wait for its answer. The Mac's first reply after an
+    # offer is usually just the layout/config rects; its answer (message 2)
+    # follows ~0.2 s later. Re-sending meanwhile makes it start and tear down
+    # a stream per offer (the old "degenerate answer" loop), so only fall
+    # back to re-sending when no answer comes. ISS_OFFER_RESEND=1 restores
+    # the old re-send-every-0.2 s behaviour.
+    if os.environ.get("ISS_OFFER_RESEND") == "1":
+        canvas = _read_video_answer(sock, cipher, leftover_msgs)
+    else:
+        canvas = _await_video_answer(sock, cipher, leftover_msgs, _ANSWER_WAIT_S,
+                                     layout_backing=layout_backing)
     if canvas[0] and canvas[1]:
         return keys, canvas
 
@@ -805,11 +826,16 @@ def connect_and_negotiate(
     else:
         _phase_handshake_plaintext(sock, advertise, hdr, curtain=curtain)
 
-    cipher = _phase_enable_enc1103(sock, ecb_key)
+    cipher, drained = _phase_enable_enc1103(sock, ecb_key)
+    # The display layout arriving here gives the canvas if the answer
+    # doesn't (see `_await_video_answer`).
+    layout_backing = next(
+        (b for b in map(fbu_layout_backing, reversed(drained)) if b), None)
     leftover_msgs: list[bytes] = []
     keys, (canvas_w, canvas_h, canvas_tiles) = _phase_media_offer(
         sock, cipher, audio_offer, video_offer,
         alt_session=alt_session, leftover_msgs=leftover_msgs,
+        layout_backing=layout_backing,
     )
 
     return NegotiationResult(
@@ -875,6 +901,10 @@ def _read_until_enc1103(
                     p += 36
                 elif enc in (1010, 1011) and p + 2 <= len(init):
                     sz = struct.unpack(">H", init[p:p + 2])[0]
+                    if enc == 1010:
+                        m = parse_media_body(bytes(init[p + 2:p + 2 + sz]))
+                        if m is not None:
+                            log.info("media stream (plaintext): %s", m.describe())
                     p += 2 + sz
                 else:
                     break
@@ -891,13 +921,25 @@ def _read_until_enc1103(
     log.info("enc1103 OK")
 
     if pos < len(init):
-        cipher.decrypt_stream(bytes(init[pos:]))  # discard tail; we only want the side-effect of advancing the recv counter
+        tail, _ = cipher.decrypt_stream(bytes(init[pos:]))
+        _log_media_msgs(tail, "enc1103 tail")
     return cipher
+
+
+def _log_media_msgs(msgs: list[bytes], where: str) -> None:
+    for msg in msgs:
+        found = False
+        for m in iter_fbu_media_msgs(msg):
+            found = True
+            log.info("media stream (%s): %s", where, m.describe())
+        if not found and msg and msg[0] == 0 and len(msg) >= 16:
+            log.debug("(%s) other msg len=%d first rect enc=%d", where, len(msg),
+                      struct.unpack(">i", msg[12:16])[0])
 
 
 def _drain_through_cipher(
     sock: socket.socket, cipher: StreamCipher, *, timeout: float,
-) -> None:
+) -> list[bytes]:
     """Read whatever's queued on the socket and feed it through `decrypt_stream`
     so the cipher's receive counter stays aligned with the server."""
     sock.settimeout(timeout)
@@ -912,7 +954,91 @@ def _drain_through_cipher(
         pass
     sock.settimeout(15)
     if pre:
-        cipher.decrypt_stream(bytes(pre))  # discard tail; we only want the side-effect of advancing the recv counter
+        msgs, _ = cipher.decrypt_stream(bytes(pre))
+        _log_media_msgs(msgs, "drain")
+        return msgs
+    return []
+
+
+def _await_video_answer(
+    sock: socket.socket, cipher: StreamCipher,
+    leftover_msgs: Optional[list[bytes]], timeout: float,
+    *, layout_backing: Optional[tuple[int, int]] = None,
+) -> tuple[int, int, int]:
+    """Read the control stream for up to `timeout` s until a message 2 (the
+    answer) carrying the encoder canvas arrives. Every other decrypted
+    message goes to `leftover_msgs`. Returns zeros on timeout or when the
+    Mac refuses the offer (message 3).
+
+    Some answers carry no canvas (zero size) although the stream starts
+    anyway; re-offering then only starts a second stream. In that case the
+    canvas is the display layout's backing size (seen in this exchange or
+    passed in as `layout_backing`), and the tile count is what we offered."""
+    deadline = time.monotonic() + timeout
+    buf = bytearray()
+    try:
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                log.info("0x1c: no answer within %.1f s", timeout)
+                return 0, 0, 0
+            sock.settimeout(left)
+            try:
+                chunk = sock.recv(65536)
+            except socket.timeout:
+                continue
+            if not chunk:
+                return 0, 0, 0
+            buf += chunk
+            msgs, consumed = cipher.decrypt_stream(bytes(buf))
+            del buf[:consumed]
+            canvas: tuple[int, int, int] = (0, 0, 0)
+            for msg in msgs:
+                refused = None
+                answered = False
+                for m in iter_fbu_media_msgs(msg):
+                    log.info("media stream (answer wait): %s", m.describe())
+                    if m.kind == 3:
+                        refused = m
+                    elif m.kind == 2:
+                        answered = True
+                layout_backing = fbu_layout_backing(msg) or layout_backing
+                cw, ch, ct = extract_canvas_dims(msg)
+                if answered and not cw and layout_backing and not canvas[0]:
+                    cw, ch = layout_backing
+                    ct = tiles_per_frame()
+                    log.info("0x1c: the answer carries no canvas; using the display "
+                             "layout's %dx%d", cw, ch)
+                if cw and ch and not canvas[0]:
+                    log.info("encoder canvas: %dx%d (%d tiles)", cw, ch, ct)
+                    canvas = (cw, ch, ct)
+                elif leftover_msgs is not None:
+                    leftover_msgs.append(msg)
+                if refused is not None:
+                    log.warning("0x1c: the Mac refused the offer: %s", refused.describe())
+            if canvas[0]:
+                # Never return mid-record: the session's reader starts on a
+                # record boundary. Finish any partial record (the Mac sends
+                # records whole, so the rest is already on its way).
+                end = time.monotonic() + 1.0
+                while buf and time.monotonic() < end:
+                    sock.settimeout(max(0.05, end - time.monotonic()))
+                    try:
+                        chunk = sock.recv(65536)
+                    except socket.timeout:
+                        continue
+                    if not chunk:
+                        break
+                    buf += chunk
+                    more, consumed = cipher.decrypt_stream(bytes(buf))
+                    del buf[:consumed]
+                    if leftover_msgs is not None:
+                        leftover_msgs.extend(more)
+                if buf:
+                    log.warning("0x1c: %d bytes of a partial record left after the answer", len(buf))
+                return canvas
+    finally:
+        sock.settimeout(15)
 
 
 def _read_video_answer(
@@ -946,6 +1072,7 @@ def _read_video_answer(
     if not answer:
         return 0, 0, 0
     msgs, _ = cipher.decrypt_stream(bytes(answer))
+    _log_media_msgs(msgs, "answer read")
     canvas_seen: tuple[int, int, int] = (0, 0, 0)
     for msg in msgs:
         log.debug("0x1c answer msg cmd=0x%02x len=%d", msg[0], len(msg))
