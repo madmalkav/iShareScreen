@@ -127,8 +127,7 @@ offline replay), `ISS_DECODE_DELAY_MS` (simulate a slow decoder).
 6. **ProRes:** revisit only if a way to request it becomes known (see above).
 7. **From the remotex notes (rfc §8.11, §10.3, §10.7, §10.8), not built yet:**
    - `--max-bitrate`: offer tiers ≤ N to cap the encoder for slow viewers (better than the backlog guard, PR #27).
-   - Offer `0x1c` only after the host's message 1, once per message 1: the likely root cause of the degenerate answers and
-     re-sends (see Start above, and the dropped "one offer at a time").
+   - Offer once per host message 1: done in PR #30 (one offer at connect, re-offer per message 1, display-wake fix).
    - Keyframe requests: the host drops one within 1 s (1 tile) / 10 ms (4 tiles) of its last keyframe; re-request until a
      usable picture arrives.
    - PT 192 is AVConference's own FIR form, not RFC 2032's, which iss sends. Send the real form or drop it.
