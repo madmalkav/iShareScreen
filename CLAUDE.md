@@ -9,7 +9,8 @@ guide is the README's "Codecs and decoders" section.
 - `proxy/session.py`: the session core. Handshake + start burst, UDP drain/process threads, RTCP (RR, FIR/PLI, NACK, LTR ack,
   RCTL), SSRC adoption, stall/liveness logic, the profile log line.
 - `proxy/protocol/`:
-  - `negotiation.py`: handshake, `0x1c` offer/answer, degenerate-answer re-query loop.
+  - `negotiation.py`: handshake, one `0x1c` offer + answer wait (re-send loop only as fallback).
+  - `mediamsg.py`: the Mac's media-stream messages (encoding 1010: message 1 ports, 2 answer, 3 error).
   - `offers.py`: AVConference offer protobuf.
   - `rfb.py`: `0x1d` virtual display.
   - `burst.py`: start burst → param sets + per-tile NALUs.
@@ -57,10 +58,16 @@ guide is the README's "Codecs and decoders" section.
 - **4 tiles:** Apple's default `tilesPerFrame=4` = 4 horizontal strips = 4 consecutive SSRCs, cross-tile references, DONL in
   every payload. `tilesPerFrame=1` has no DONL (depacketizer must handle both), makes the host send only ~57.5 fps, and saves no
   decode CPU. Keep 4.
-- **Start:** the host's first `0x1c` answer often has a zero canvas. iss re-sends the offer every 0.2 s until one has a canvas;
-  each re-send makes the host start and tear down a stream with new SSRCs. SSRC adoption must pick the group that is **still
-  sending** (last-packet time per SSRC), not the lowest-numbered one (#21). Since #21 one "falling behind" resync appears just
-  before `session ready`; it's harmless.
+- **Start:** the Mac's message 1 (ports) arrives in the drain right after the cipher starts, before iss offers. iss sends
+  **one** offer and reads until message 2 (the answer, ~0.05–0.2 s). The "degenerate answers" were iss reading only the
+  first chunk (layout/config rects); some answers really carry no canvas, but the stream starts anyway, so iss takes the
+  canvas from the layout's backing size. Re-sending (old behaviour, `ISS_OFFER_RESEND=1`) starts a new stream per offer.
+  The start burst stops once the socket backlog is drained, on a picture boundary (RTP marker): a continuous stream never
+  pauses 50 ms. With one offer: 1 SSRC group, 0–3 reference errors (old: 2–7 groups, ~33). SSRC adoption must still pick
+  the group that is **still sending** (#21). One "falling behind" resync just after the burst is still normal.
+- **Display changes:** every display change, including a wake from display sleep (same geometry), stops both legs; the
+  Mac then sends a message 1 and restarts the stream only for a new offer. iss re-offers once per message 1 (0.3 s
+  debounce), with a 1 s fallback on a geometry change that brings no message 1 (`ISS_REOFFER_ON_MSG1=0` = old trigger).
 - **Resize:** after `0x1d`, re-arm with a 1×1 incremental FramebufferUpdateRequest, never full-screen (a full-size read racing
   a shrink can crash the host's ScreensharingAgent, per remotex) (#24).
 - **Liveness:** no video + no host RTCP for 10 s → warning; 48 s → session ends (Apple's limit). Armed only after host RTCP has
@@ -92,13 +99,11 @@ guide is the README's "Codecs and decoders" section.
 #23 RTCP demux · #24 1×1 resize request · #25 RTCP liveness.
 
 Useful env switches: `ISS_HWACCEL`, `ISS_HW_SLOW_FALLBACK=0`, `ISS_PREFER_CUDA=0`, `ISS_HW_FRAMES_ON_GPU`, `ISS_RCTL=0`,
-`ISS_RCTL_BWE_KBPS`, `ISS_VIDEO_RTCP_ON_CTRL=1` (old routing), `ISS_TILES_PER_FRAME`, `ISS_NALU_DUMP=<file>` (record HEVC for
-offline replay), `ISS_DECODE_DELAY_MS` (simulate a slow decoder).
+`ISS_RCTL_BWE_KBPS`, `ISS_VIDEO_RTCP_ON_CTRL=1` (old routing), `ISS_OFFER_RESEND=1` + `ISS_REOFFER_ON_MSG1=0` (old offer
+flow), `ISS_TILES_PER_FRAME`, `ISS_NALU_DUMP=<file>` (record HEVC for offline replay), `ISS_DECODE_DELAY_MS` (simulate a slow
+decoder).
 
 ## Tried and dropped (don't retry without a new idea)
-- **One `0x1c` offer at a time** (wait for the complete answer instead of re-sending): the stream is already running when the
-  answer arrives, and the start burst then decodes mid-sequence. Flush + keyframe request + a 0.5 s burst cap still
-  corrupted 3/6 starts. The re-send loop + #21 gives clean starts.
 - **Connected UDP sockets:** on macOS `sendto()` with an address on a connected socket fails (EISCONN; ~12 call sites), and ICMP
   unreachables become receive errors; the gain is marginal.
 - **Lossless framebuffer path** (zlib/CopyRect instead of video): works, but the host delivers only ~4–8 fps for a changing
