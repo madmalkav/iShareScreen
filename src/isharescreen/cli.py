@@ -325,7 +325,20 @@ def _parse_advertise(spec: Optional[str]) -> Optional[AdvertiseDims]:
         raise SystemExit(
             f"invalid --advertise value {spec!r}: expected 'WxH' or 'WxH@HIDPI' ({e})"
         ) from e
+    if width < _MIN_ADVERTISE_W or height < _MIN_ADVERTISE_H:
+        # Same floor the desktop viewer's resize path uses. Below it the Mac
+        # can't always encode: with 4 tiles a display some heights tall (e.g.
+        # 90 rows) gets no picture at all (encoder error -12902).
+        nw, nh = max(width, _MIN_ADVERTISE_W), max(height, _MIN_ADVERTISE_H)
+        print(f"iss: --advertise {width}x{height} is below the {_MIN_ADVERTISE_W}x"
+              f"{_MIN_ADVERTISE_H} minimum; using {nw}x{nh}", file=sys.stderr)
+        width, height = nw, nh
     return AdvertiseDims(width=width, height=height, hidpi_scale=hidpi)
+
+
+# Smallest --advertise (logical points), as the desktop viewer's resize path.
+_MIN_ADVERTISE_W = 640
+_MIN_ADVERTISE_H = 480
 
 
 def _password_from_args(args: argparse.Namespace) -> Optional[str]:
