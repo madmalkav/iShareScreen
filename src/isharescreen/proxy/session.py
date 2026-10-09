@@ -3252,15 +3252,14 @@ class Session:
         # bugs like "cursor freezes after idle" — if msg type=0x00 stops
         # incrementing during the freeze, the daemon stopped sending.
         self._rx_pkts_tcp += 1
-        t = msg[0]
-        self._rx_msg_type_counts[t] = self._rx_msg_type_counts.get(t, 0) + 1
         # Optional RE hook: dump every inbound RFB msg type + body.
         if os.environ.get("ISS_LOG_RFB_IN") == "1":
             log.info("RX type=0x%02x len=%d body=%s", msg[0], len(msg), msg[:512].hex())
 
         # Multi-cipher-frame 0x1f reassembly: continuation frames don't
         # carry a type byte, so any inbound msg while reassembly is
-        # in-progress belongs to the in-flight clipboard send.
+        # in-progress belongs to the in-flight clipboard send. They are
+        # not counted in the type histogram: their first byte is data.
         if self._clipboard_reassembler.in_progress:
             full = self._clipboard_reassembler.feed(msg)
             if full is not None:
@@ -3268,6 +3267,7 @@ class Session:
             return
 
         msg_type = msg[0]
+        self._rx_msg_type_counts[msg_type] = self._rx_msg_type_counts.get(msg_type, 0) + 1
 
         # 0x14: misc-status push. Wire layout (8 bytes):
         #   [0]    type     = 0x14
