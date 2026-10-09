@@ -48,8 +48,9 @@ guide is the README's "Codecs and decoders" section.
   server→viewer `*_s`). RTCP must go to the leg it belongs to under that leg's key (#22).
 - **RTP/RTCP demux:** RTCP is `b[1]` in 192–223 (RFC 5761). Masking with `0x7F` (an RTP check) drops every RTCP packet (#23).
   The host sends an SR on each leg ~1/s, even on a still screen.
-- **Rate control:** the host encoder follows AVConference's rate controller, bounded 20–60 Mbit/s by the screen-sharing profile
-  (the offer's bitrate tiers don't change it). It only moves on the viewer's **RCTL** reports: an RTCP APP packet named
+- **Rate control:** the host encoder follows AVConference's rate controller, between a 20 Mbit/s floor and a ceiling of the
+  offer's bitrate tiers capped at 60 (offering more doesn't raise it). An offer capped **below** 20 makes the encoder run at
+  that cap ([REMOTEX]; not yet tried here): the way to limit the stream for slow viewers. It only moves on the viewer's **RCTL** reports: an RTCP APP packet named
   `RCTL` with a 20-byte payload, sent alone (not compound), every 50 ms on the video leg. The one-way-delay field is what
   moves the target. With RCTL the target sits at ~58 Mbit/s; without it, it stays at ~20.8 (#20). TMMBR and the BWE field
   are ignored.
@@ -66,6 +67,8 @@ guide is the README's "Codecs and decoders" section.
   been seen (#25).
 - **Refresh:** the host accepts any virtual-display refresh in the `0x1d` mode (30/60/90/120), but its **encoder frame rate stays
   60** (`vcMediaStreamFramerate = 60`). 30 Hz halves the pictures and decode cost; >60 gives nothing.
+- **`AutoFrameBufferUpdate` (`0x09`):** its `u32` is a push interval in µs, `0xffffffff` = pushes off ([REMOTEX], rfc §8.11).
+  iss arms nothing and polls 1×1 incremental every tx tick, which keeps cursor shapes flowing.
 - **Curtain mode** (default) gives the virtual display at the requested size and locks the host's local screen while the session
   runs; the host stays locked after the session ends. `--no-curtain` shares the physical display (e.g. native 5120×2160).
   The host may switch the session to its physical display on a local login/idle (see open topics).
@@ -100,7 +103,8 @@ offline replay), `ISS_DECODE_DELAY_MS` (simulate a slow decoder).
   unreachables become receive errors; the gain is marginal.
 - **Lossless framebuffer path** (zlib/CopyRect instead of video): works, but the host delivers only ~4–8 fps for a changing
   window.
-- **Offer bitrate tiers / TMMBR** to raise the bitrate: no effect (RCTL is the lever).
+- **Offer bitrate tiers / TMMBR** to *raise* the bitrate: no effect (RCTL is the lever). Tiers can still *lower* the cap (see
+  Rate control above).
 - **ProRes:** AVConference has a ProRes codec type, but how to request it (payload/params) and whether the screen-sharing
   profile supports it are unknown. Apple's viewer offers only HEVC and H.264.
 
@@ -121,6 +125,11 @@ offline replay), `ISS_DECODE_DELAY_MS` (simulate a slow decoder).
 5. **Host rate-control inputs not sent:** RCTL's second byte (meaning unknown) and loss/BWE fields are sent as 0/60000.
    Loss reporting might matter on lossy links; untested.
 6. **ProRes:** revisit only if a way to request it becomes known (see above).
-7. **`AutoFrameBufferUpdate` (`0x09`) body:** static analysis reads a `selected_screen` word where [REMOTEX] measured a push
-   interval in µs (rfc §8.11). iss arms nothing and polls 1×1 every tx tick, which keeps cursor shapes flowing; resolve before
-   relying on `0x09`.
+7. **From the remotex notes (rfc §8.11, §10.3, §10.7, §10.8), not built yet:**
+   - `--max-bitrate`: offer tiers ≤ N to cap the encoder for slow viewers (better than the backlog guard, PR #27).
+   - Offer once per host message 1: done in PR #30 (one offer at connect, re-offer per message 1, display-wake fix).
+   - Keyframe requests: the host drops one within 1 s (1 tile) / 10 ms (4 tiles) of its last keyframe; re-request until a
+     usable picture arrives.
+   - PT 192 is AVConference's own FIR form, not RFC 2032's, which iss sends. Send the real form or drop it.
+   - 1-tile (H.264) streams: LTR acks (payload = RTP timestamp) + PSFB FMT 2 refresh requests instead of IDRs. 4 tiles have no LTR.
+   - Scroll message `0x17` (precise, both axes); two virtual displays; records >65,520 bytes split.

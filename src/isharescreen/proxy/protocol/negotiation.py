@@ -585,6 +585,9 @@ def build_auto_framebuffer_update(width: int, height: int) -> bytes:
     msg 0x09 is NOT a cursor re-arm — the enc-1104 cursor works without it
     (the periodic 1x1 incremental FBU poll re-arms the cursor sender). Kept
     here only for protocol reference; do not call it on the idle path.
+    (As built below, with the interval word all-ones, the remotex notes say
+    the host pushes nothing; how the free-running above was produced was not
+    recorded. Unverified either way.)
 
     This is the message that arms the daemon's `SendFrameBuffer` loop to
     *free-run* TCP-side updates (including the cursor pseudo-encoding 1104
@@ -596,10 +599,12 @@ def build_auto_framebuffer_update(width: int, height: int) -> bytes:
 
     Wire format (mirrors the native byte-for-byte):
         [0]      0x09 message type
-        [1..2]   0x0000 padding
-        [3]      0x01  (enable)
-        [4..7]   0xffffffff
-        [8..11]  0x00000000
+        [1]      0x00 reserved
+        [2..3]   u16 BE version = 1
+        [4..7]   u32 BE push interval in microseconds; 0xffffffff turns the
+                 pushes off (Apple's viewer sends it only while paused, and
+                 arms a running session with 0)
+        [8..11]  u16 BE x, y = 0
         [12..13] u16 BE region width (backing/pixel dims)
         [14..15] u16 BE region height
     """
