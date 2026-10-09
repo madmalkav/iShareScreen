@@ -508,6 +508,7 @@ def _phase_session_select(
 
 def _phase_handshake_plaintext(
     sock: socket.socket, advertise: AdvertiseDims, hdr: bool, curtain: bool,
+    refresh_hz: float = 60.0,
 ) -> None:
     """Send the messages that must arrive plaintext, before enc1103 takes
     effect: ViewerInfo (+ 0x12 / 0x0a Apple follow-ups), the optional
@@ -536,6 +537,7 @@ def _phase_handshake_plaintext(
             height=advertise.height,
             hidpi_scale=advertise.hidpi_scale,
             hdr=hdr,
+            refresh_hz=refresh_hz,
         ))
     else:
         log.info("curtain=off — skipping SetDisplayConfiguration; "
@@ -706,6 +708,7 @@ def connect_and_negotiate(
     advertise: Optional[AdvertiseDims] = None,
     hdr: bool = False,
     curtain: bool = True,
+    refresh_hz: float = 60.0,
     audio_offer: Optional[bytes] = None,
     video_offer: Optional[bytes] = None,
     share_console: bool = False,
@@ -821,10 +824,12 @@ def connect_and_negotiate(
             hidpi_scale=advertise.hidpi_scale,
             hdr=hdr,
             alt_user_login=True,
+            refresh_hz=refresh_hz,
         ))
         sock.sendall(build_set_encodings(HP_ENCODINGS_FULL))
     else:
-        _phase_handshake_plaintext(sock, advertise, hdr, curtain=curtain)
+        _phase_handshake_plaintext(sock, advertise, hdr, curtain=curtain,
+                                   refresh_hz=refresh_hz)
 
     cipher, drained = _phase_enable_enc1103(sock, ecb_key)
     # The display layout arriving here gives the canvas if the answer
