@@ -20,6 +20,11 @@ Plaintext payload inside the cipher block:
     bytes   pad             (zero pad to 16-byte alignment after the 20-byte mac)
     bytes   mac             (plain SHA1(u32_be(counter) || everything-before-mac); NOT HMAC)
 
+A record's ciphertext is at most 65,520 bytes (the largest multiple of 16 a
+u16 can hold), so its body is at most 65,498 bytes. A longer message goes out
+as full records and then the rest; the receiver concatenates them (the
+remotex notes, "Records").
+
 Counter is per-direction, starts at 0, increments on each successful decrypt
 or each encrypt. Decryption tolerates a small lookahead window because Apple
 sometimes pipelines a re-key reply before the previous decrypt's counter has
@@ -41,6 +46,8 @@ log = logging.getLogger(__name__)
 _MAC_LEN = 20  # plain SHA-1-160 tag (not HMAC)
 _BLOCK = 16    # AES-128 block size
 _DECRYPT_COUNTER_WINDOW = 6  # forgive up to 6-message gaps from server
+_MAX_RECORD = 65_520         # largest ciphertext a u16 length can frame
+MAX_RECORD_BODY = _MAX_RECORD - 2 - _MAC_LEN   # 65,498: no filler needed
 
 
 class StreamCipher:
@@ -81,10 +88,18 @@ class StreamCipher:
         self._enc_ctr = counter + 1
         return struct.pack(">H", len(ciphertext)) + ciphertext
 
+    def _encrypt_records_locked(self, plaintext: bytes) -> bytes:
+        """Encrypt a message as one record, or as several when it is longer
+        than a record's body. Caller MUST hold `self._lock`."""
+        if len(plaintext) <= MAX_RECORD_BODY:
+            return self._encrypt_locked(plaintext)
+        return b"".join(self._encrypt_locked(plaintext[i:i + MAX_RECORD_BODY])
+                        for i in range(0, len(plaintext), MAX_RECORD_BODY))
+
     def encrypt_message(self, plaintext: bytes) -> bytes:
         """Wrap a control-channel message (RFB body) for sending."""
         with self._lock:
-            return self._encrypt_locked(plaintext)
+            return self._encrypt_records_locked(plaintext)
 
     def encrypt_and_send(self, sock, plaintext: bytes) -> None:
         """Encrypt and write to `sock` atomically under the cipher lock.
@@ -97,7 +112,7 @@ class StreamCipher:
         wire under backpressure and desync the server's record framing.
         Holding the lock across both keeps counter order == wire order."""
         with self._lock:
-            enc = self._encrypt_locked(plaintext)
+            enc = self._encrypt_records_locked(plaintext)
             sock.sendall(enc)
 
     def decrypt_message(self, ciphertext: bytes) -> Optional[bytes]:
