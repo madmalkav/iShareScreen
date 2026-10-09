@@ -259,6 +259,9 @@ class SessionConfig:
     advertise: Optional[AdvertiseDims] = None
     hdr: bool = False
     audio: bool = True
+    # Cap on the host's video bitrate (kbit/s) via the offer's bitrate tiers;
+    # None = Apple's tiers (the host adapts between 20 and 60 Mbit/s).
+    max_bitrate_kbps: Optional[int] = None
     # HiDPI mode for the host's virtual display, resolved to a backing:point
     # ratio by the frontend (which knows the window size):
     #   "on"   → always 2× (Retina): crisp, but ~4× the pixels = more
@@ -1471,7 +1474,11 @@ class Session:
         False we additionally gate the server's audio transmitter off via the
         audio-description field4 (see offers._build_mediablob) so no audio
         flows on the wire — not just skipping local decode + playback."""
-        video_offer, audio_offer = create_offers(audio_enabled=cfg.audio)
+        video_offer, audio_offer = create_offers(
+            audio_enabled=cfg.audio, max_bitrate_kbps=cfg.max_bitrate_kbps)
+        if cfg.max_bitrate_kbps:
+            log.info("video bitrate capped at %d kbit/s (offer tiers)",
+                     cfg.max_bitrate_kbps)
         # Stash for mid-session 0x1c re-offers (dynamic resolution).
         self._video_offer = video_offer
         self._audio_offer = audio_offer
@@ -3683,7 +3690,9 @@ class Session:
             vo = getattr(self, '_video_offer', None)
             ao = getattr(self, '_audio_offer', None)
             if vo is None or ao is None:
-                vo, ao = create_offers(audio_enabled=self._config.audio)
+                vo, ao = create_offers(
+                    audio_enabled=self._config.audio,
+                    max_bitrate_kbps=self._config.max_bitrate_kbps)
             msg_1c = build_0x1c(
                 ao, vo, neg.keys,
                 alt_session=self._config.alt_session,

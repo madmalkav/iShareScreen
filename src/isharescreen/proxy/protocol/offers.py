@@ -115,6 +115,21 @@ def _build_audio_f9_entry(f1: int, f2: int, f3: Optional[int]) -> bytes:
 _APPLE_AUDIO_F9 = b"".join(_build_audio_f9_entry(*t) for t in _AUDIO_F9_TIERS)
 
 
+def _f9_entries(max_bps: Optional[int] = None) -> bytes:
+    """The f9 tier list, optionally capped. The Mac's video rate controller
+    moves between a 20 Mbit/s floor and a ceiling from these kind-0 (network
+    bitrate) entries, at most 60 Mbit/s; a ceiling under 20 makes the encoder
+    run at it (remotex notes, "Rate control"). Capping lowers every kind-0
+    entry above `max_bps` to `max_bps` and keeps the list's shape: dropping
+    entries instead left the Mac with no ceiling at all (TX max bitrate 0) and
+    no video, even when a 40 Mbit/s entry remained."""
+    if not max_bps:
+        return _APPLE_AUDIO_F9
+    return b"".join(
+        _build_audio_f9_entry(kind, min(bps, max_bps) if kind == 0 else bps, buf)
+        for kind, bps, buf in _AUDIO_F9_TIERS)
+
+
 # ── HEVC + AVC parameter strings ──────────────────────────────────────
 
 # `LTR;` advertises the long-term-reference capability. LTRP is ON by default
@@ -200,6 +215,7 @@ _AUDIO_F4_OFF = 1000
 
 def _build_mediablob(
     mode: int, session_id: int, timestamp: int, *, audio_enabled: bool = True,
+    max_bitrate_kbps: Optional[int] = None,
 ) -> bytes:
     """Build the MediaBlob protobuf. mode 7 = video, mode 8 = audio. Output
     matches Apple's createOffer modulo the dynamic fields. `audio_enabled`
@@ -301,13 +317,14 @@ def _build_mediablob(
         + desc_field
         + _field_bytes(6, f"iShareScreen {__version__}".encode("ascii"))
         + _field_varint(8, 0)
-        + _APPLE_AUDIO_F9
+        + _f9_entries(max_bitrate_kbps * 1000 if max_bitrate_kbps else None)
         + _field_varint(13, timestamp)
         + _field_varint(14, 2) + _field_varint(16, 0) + _field_varint(18, 1)
     )
 
 
-def create_offers(*, audio_enabled: bool = True) -> tuple[bytes, bytes]:
+def create_offers(*, audio_enabled: bool = True,
+                  max_bitrate_kbps: Optional[int] = None) -> tuple[bytes, bytes]:
     """Generate fresh (video, audio) offer plists. Each call produces a new
     session_id, timestamp, and CallID UUID. `audio_enabled=False` builds an
     audio offer that negotiates the stream (the daemon requires the section)
@@ -317,7 +334,8 @@ def create_offers(*, audio_enabled: bool = True) -> tuple[bytes, bytes]:
         session_id = secrets.randbits(32)
         timestamp = time.time_ns()
         blob = _build_mediablob(
-            mode, session_id, timestamp, audio_enabled=audio_enabled)
+            mode, session_id, timestamp, audio_enabled=audio_enabled,
+            max_bitrate_kbps=max_bitrate_kbps)
         plist = {
             "avcMediaStreamOptionRemoteEndpointInfo": _REMOTE_ENDPOINT_INFO,
             "avcMediaStreamNegotiatorMode": mode,
