@@ -204,6 +204,12 @@ an API with `--hwaccel`, to keep hardware.
 
 - **Choppy picture or gray patches:** the decoder can't keep up. Try
   `--codec avc`, a smaller `--advertise`, or a different `--hwaccel`.
+- **The picture falls further and further behind (slow network or slow
+  decoder):** cap the Mac's video bitrate with `--max-bitrate` (Mbit/s), e.g.
+  `--max-bitrate 8`. Without a cap the Mac uses 20–60 Mbit/s; a cap lowers that
+  ceiling, and a cap below 20 makes it encode at the cap. Example: software
+  H.264 on a single CPU core fell behind by thousands of packets at the default
+  ~39 Mbit/s and kept up with `--max-bitrate 8`. Fine detail softens at low caps.
 - **Text is blurry for a moment after scrolling, then sharpens:** the Mac's
   encoder is short of bits. The Mac adapts its video bitrate (between 20 and
   60 Mbit/s) to the viewer's rate-control reports, which iss sends like Apple's

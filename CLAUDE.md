@@ -51,7 +51,8 @@ guide is the README's "Codecs and decoders" section.
   The host sends an SR on each leg ~1/s, even on a still screen.
 - **Rate control:** the host encoder follows AVConference's rate controller, between a 20 Mbit/s floor and a ceiling of the
   offer's bitrate tiers capped at 60 (offering more doesn't raise it). An offer capped **below** 20 makes the encoder run at
-  that cap ([REMOTEX]; not yet tried here): the way to limit the stream for slow viewers. It only moves on the viewer's **RCTL** reports: an RTCP APP packet named
+  that cap: `--max-bitrate` (verified at 8/15/40: the host's `bitrateCap` follows). The tiers must be **clamped** (every
+  kind-0 f9 entry lowered to the cap); dropping entries above the cap leaves `vcMediaStreamTXMaxBitrate = 0` and no video. It only moves on the viewer's **RCTL** reports: an RTCP APP packet named
   `RCTL` with a 20-byte payload, sent alone (not compound), every 50 ms on the video leg. The one-way-delay field is what
   moves the target. With RCTL the target sits at ~58 Mbit/s; without it, it stays at ~20.8 (#20). TMMBR and the BWE field
   are ignored.
