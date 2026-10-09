@@ -234,6 +234,7 @@ def build_virtual_display(
     display_name: str = "iShareScreen Virtual Display",
     mode_count: int = 5,
     alt_user_login: bool = False,
+    refresh_hz: float = 60.0,
 ) -> bytes:
     """0x1d HandleSetDisplayConfiguration — sets the virtual-display
     geometry. Used both for the initial handshake and for mid-session
@@ -338,7 +339,11 @@ def build_virtual_display(
         mh = int(msh * hidpi_scale + 0.5)
         m = 0x9C + 28 * i
         struct.pack_into(">IIII", di, m + 0x00, mw, mh, msw, msh)
-        struct.pack_into(">d", di, m + 0x10, 60.0)
+        # Refresh of each mode. The Mac sends a picture at most once per
+        # refresh of the virtual display and encodes at most 60/s, so 30
+        # halves the pictures (and the viewer's decode work) while 60
+        # (Apple's value) is the most it delivers.
+        struct.pack_into(">d", di, m + 0x10, float(refresh_hz))
         struct.pack_into(">I", di, m + 0x18, mode_flags)
 
     # max_width/height = 3840×2160, matching native app. The server
