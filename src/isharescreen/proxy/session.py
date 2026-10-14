@@ -192,12 +192,20 @@ _SSRC_ADOPT_STALL_S = 2.0
 # pending-groups dict growing unbounded on lossy links.
 _PENDING_GROUP_TTL_S = 0.2
 
+# NACKs. The Mac reads a Generic NACK but never resends: every stream it
+# configures has retransmission off (vcMediaStreamIsRTXEnabled = 0, measured
+# here), and it would resend only while its round-trip estimate for the
+# picture leg is under 200 ms, which stays at the 250 ms it starts from
+# (remotex protocol notes). So by default iss sends none, and waits for a
+# missing packet only as long as a LAN reorder takes. ISS_NACK=1 restores the
+# NACKs and the longer wait, e.g. for a future host that does retransmit.
+_NACK_ENABLED = os.environ.get("ISS_NACK", "0") == "1"
+
 # AVC only: once a later packet exposes an RTP sequence gap, retain that access
-# unit (and later units behind it) briefly while an immediate NACK asks Apple
-# for the missing packet. LAN retransmits normally arrive within a few
-# milliseconds; 75 ms gives generous headroom without adding latency to
-# healthy frames, which still flush immediately.
-_AVC_RTP_REPAIR_WAIT_S = 0.075
+# unit (and later units behind it) briefly in case the missing packet is only
+# late. Healthy frames still flush immediately. With NACKs on, 75 ms gives a
+# retransmit generous headroom; without them the wait only covers reordering.
+_AVC_RTP_REPAIR_WAIT_S = 0.075 if _NACK_ENABLED else 0.010
 
 # How long a completed (marker-flushed) (SSRC, ts) key stays in the dedup
 # set so we drop late retransmits of already-processed packets without
@@ -4466,6 +4474,9 @@ class Session:
         self._last_concealment_msg = ""
 
     def _drain_pending_nack(self) -> None:
+        if not _NACK_ENABLED:
+            self._nack_pending.clear()     # the Mac never resends (see above)
+            return
         sock, port = self._video_rtcp_dest()
         enc = self._srtcp_enc
         sender = self._our_video_ssrc
