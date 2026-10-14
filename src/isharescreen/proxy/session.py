@@ -280,6 +280,15 @@ def _warm_decoder_probe() -> None:
     threading.Thread(target=_run, name="iss-probe-warmup", daemon=True).start()
 
 
+def _precise_scroll_ok(neg) -> bool:
+    """Send scrolls as 0x17 when the Mac's ServerInit lists it (Apple's
+    viewer does the same); ISS_PRECISE_SCROLL=0 keeps wheel buttons."""
+    if os.environ.get("ISS_PRECISE_SCROLL", "1") == "0":
+        return False
+    from .protocol.negotiation import server_accepts
+    return server_accepts(getattr(neg, "server_bitmap", b""), 0x17)
+
+
 # Re-offer timing (seconds) after the Mac's message 1, and the fallback after
 # a geometry change that brings no message 1.
 _REOFFER_SETTLE_S = 0.3
@@ -1409,6 +1418,7 @@ class Session:
             server_width=self._negotiation.canvas_width,
             server_height=self._negotiation.canvas_height,
             alt_session=cfg.alt_session,
+            precise_scroll=_precise_scroll_ok(self._negotiation),
         )
 
         # 9b) Inbound clipboard sync (host → local OS). Enable the daemon's

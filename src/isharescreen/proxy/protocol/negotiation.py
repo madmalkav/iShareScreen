@@ -127,6 +127,9 @@ class NegotiationResult:
     # already advanced by their decrypt, so re-reading the socket would
     # produce garbage for those bytes.
     leftover_msgs: list[bytes] = field(default_factory=list)
+    # ServerInit's bitmap of accepted client message types (see
+    # `server_accepts`); b"" when the Mac sent none.
+    server_bitmap: bytes = b""
 
 
 # ── 0x1c message ──────────────────────────────────────────────────────
@@ -276,17 +279,29 @@ def _phase_auth(
 
 # ── phase 2: ClientInit + ServerInit ──────────────────────────────────
 
-def _phase_client_init(sock: socket.socket) -> tuple[int, int]:
+def _phase_client_init(sock: socket.socket) -> tuple[int, int, bytes]:
     """Send ClientInit (0xc1, shared-flag), read ServerInit (24-byte fixed
-    header + variable-length name). Returns (server_width, server_height)."""
+    header + variable-length name). Returns (server_width, server_height,
+    message bitmap). In Apple's extended ServerInit the "name" starts with 22
+    bytes of structure: a zero u16, a u32 of server flags and a 16-byte bitmap
+    of the client message types the Mac accepts, MSB first (remotex notes,
+    "ServerInit's name field is not a name"). The bitmap is b"" if absent."""
     sock.sendall(b"\xc1")
     head = recv_exact(sock, 24)
     name_len = struct.unpack(">I", head[20:24])[0]
-    if name_len:
-        recv_exact(sock, name_len)
+    name = recv_exact(sock, name_len) if name_len else b""
     w, h = struct.unpack(">HH", head[0:4])
-    log.info("ServerInit: %dx%d", w, h)
-    return w, h
+    bitmap = bytes(name[6:22]) if len(name) >= 22 else b""
+    log.info("ServerInit: %dx%d (accepts precise scroll 0x17: %s)", w, h,
+             server_accepts(bitmap, 0x17) if bitmap else "unknown")
+    return w, h, bitmap
+
+
+def server_accepts(bitmap: bytes, msg_type: int) -> bool:
+    """Whether the ServerInit message bitmap lists client message `msg_type`
+    (bit 7 - t % 8 of byte t // 8)."""
+    i = msg_type // 8
+    return i < len(bitmap) and bool(bitmap[i] & (0x80 >> (msg_type % 8)))
 
 
 # ── phase 2b: SessionSelect (cmd=0 share-console / cmd=2 alt-session) ────
@@ -783,7 +798,7 @@ def connect_and_negotiate(
 
     sock, ecb_key = _phase_auth(host, port, username, password, auth_mode,
                                 recorder)
-    server_w, server_h = _phase_client_init(sock)
+    server_w, server_h, server_bitmap = _phase_client_init(sock)
 
     # Auto-detect the SessionSelect prompt rather than requiring a pre-set
     # flag: the daemon emits it only when someone other than the auth user is
@@ -821,7 +836,7 @@ def connect_and_negotiate(
                 pass
             sock, ecb_key = _phase_auth(host, port, username, password,
                                         auth_mode, recorder)
-            server_w, server_h = _phase_client_init(sock)
+            server_w, server_h, server_bitmap = _phase_client_init(sock)
 
         # Read the (re-)issued SessionSelect prompt and send our cmd
         # response. For cmd=2 the body carries
@@ -892,6 +907,7 @@ def connect_and_negotiate(
         canvas_tiles=canvas_tiles,
         video_decryptor=SRTPDecryptor.from_blob(keys.video_key_s),
         leftover_msgs=leftover_msgs,
+        server_bitmap=server_bitmap,
     )
 
 

@@ -77,6 +77,32 @@ def _build_msg10_pointer(
     return bytes([0x10, 0x00]) + ct
 
 
+MSG_SCROLL_WHEEL = 0x17        # Apple's second event message
+_SCROLL_KIND_WHEEL = 11
+_SCROLL_CONTINUOUS = 0x2
+
+
+def build_scroll_wheel(points_x: int, points_y: int, x: int, y: int) -> bytes:
+    """Apple's scroll-wheel event (0x17), 58 bytes, big-endian: header, kind
+    11, line deltas as i16 and 16.16 fixed point, point deltas as i32 (x, y,
+    then a third axis), scroll/momentum phase 0, count 0, the continuous
+    flag, the pointer position. Up and left are positive. The line delta is a
+    tenth of the point delta, as the remotex client sends it; the Mac copies
+    every field into the event it posts (remotex protocol notes, "A Mac
+    scrolls by a distance")."""
+    clamp16 = lambda v: max(-32768, min(32767, v))
+    body = struct.pack(
+        ">HHhhhiiiiiiIIIIHH",
+        1, _SCROLL_KIND_WHEEL,
+        clamp16(int(points_x / 10)), clamp16(int(points_y / 10)), 0,
+        int(points_x / 10 * 65536), int(points_y / 10 * 65536), 0,
+        int(points_x), int(points_y), 0,
+        0, 0, 0, _SCROLL_CONTINUOUS,
+        x & 0xFFFF, y & 0xFFFF,
+    )
+    return struct.pack(">BBH", MSG_SCROLL_WHEEL, 0, len(body)) + body
+
+
 class InputController:
     """Thread-safe wrapper around the RFB control socket.
 
@@ -95,8 +121,13 @@ class InputController:
         server_width: int,
         server_height: int,
         alt_session: bool = False,
+        precise_scroll: bool = False,
     ) -> None:
         self._sock = sock
+        # Send scrolls as Apple's scroll-wheel message 0x17 (point deltas,
+        # both axes) instead of wheel buttons; only for a Mac whose ServerInit
+        # lists 0x17.
+        self.precise_scroll = precise_scroll
         self._cipher = cipher
         self._w = server_width
         self._h = server_height
@@ -143,7 +174,14 @@ class InputController:
         self._send(msg)
 
     def scroll_event(self, x: int, y: int, dx: int, dy: int) -> None:
-        """Apple emulates a wheel via pointer events with bits 3/4 of buttons.
+        """Scroll by (dx, dy) "ticks" at (x, y); negative dy is up, negative
+        dx is left. A tick is one pixel on the Mac either way.
+
+        With `precise_scroll` it is one 0x17 scroll-wheel message carrying
+        the distance in points on both axes, as Apple's viewer sends it.
+        Otherwise wheel buttons, below.
+
+        Apple emulates a wheel via pointer events with bits 3/4 of buttons.
 
         Each `(press, release)` pair = one wheel tick. `abs(dy)` is the number
         of ticks; the sign picks up vs down. The host's HID handler edge-
@@ -151,6 +189,12 @@ class InputController:
         Mac UI elements (Safari, Finder) eat them at >100 Hz.
 
         Horizontal scroll isn't natively supported in RFB; we ignore dx."""
+        if self.precise_scroll:
+            if dx or dy:
+                cx = max(0, min(self._w - 1, int(x)))
+                cy = max(0, min(self._h - 1, int(y)))
+                self._send(build_scroll_wheel(-int(dx), -int(dy), cx, cy))
+            return
         if dy == 0:
             return
         bit = BTN_SCROLL_UP if dy < 0 else BTN_SCROLL_DOWN
