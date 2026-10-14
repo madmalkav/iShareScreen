@@ -131,10 +131,10 @@ decoder).
 
 ## Open topics
 1. **Encoder frame rate above 60:** settled — not possible (see Tried and dropped).
-2. **Host switching to its physical display** (on local login or long idle) during a curtain session. Branch
-   `fix/return-to-virtual-display` (pushed, not merged) re-requests the virtual display after an unrequested switch; it needs
-   live confirmation (a local login or long idle during a session) before merging. (Branch `fix/hide-startup-gray` is no
-   longer needed: no gray startup pictures in 8 measured connects after #30; delete it.) The layout's session-state word ([REMOTEX] reading, rfc §8.4) may be a better trigger than inferring the switch.
+2. **Host switching to its physical display** on a local login during a curtain session: #37 re-requests the virtual
+   display when the layout header flags (+0x0e) lose bit 0 (virtual), per [REMOTEX] rfc §8.4; flags 0x5 in curtain mode
+   verified on the M4. Still needs a live check with a real local login at the Mac. (Branches `fix/return-to-virtual-display`
+   and `fix/hide-startup-gray` were superseded / not needed and are deleted.)
 3. **Software decode cost after RCTL:** at ~56 Mbit/s, 4K60 HEVC software decode needs ~6 cores. Weak CPUs rely on the
    delay feedback to make the host back off; not measured on a weak machine.
 4. **RCTL's second byte:** meaning unknown, sent as 0 (accepted). The loss bits and BWE add nothing (see facts above).
