@@ -130,10 +130,7 @@ decoder).
   profile supports it are unknown. Apple's viewer offers only HEVC and H.264.
 
 ## Open topics
-1. **Encoder frame rate above 60:** find what sets `encode frame rate 60`. First as a diagnostic, host-side
-   `defaults write com.apple.VideoConference forceVideoStreamFramerate|forceEncodeFramerate` (undo:
-   `defaults delete com.apple.VideoConference`); then look for a viewer-side offer field. At the 60 Mbit/s cap, 120 fps halves
-   the bits per picture.
+1. **Encoder frame rate above 60:** settled — not possible (see Tried and dropped).
 2. **Host switching to its physical display** (on local login or long idle) during a curtain session. Branch
    `fix/return-to-virtual-display` (pushed, not merged) re-requests the virtual display after an unrequested switch; it needs
    live confirmation (a local login or long idle during a session) before merging. (Branch `fix/hide-startup-gray` is no
