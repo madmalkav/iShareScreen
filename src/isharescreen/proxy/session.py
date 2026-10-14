@@ -231,6 +231,27 @@ class _CursorImage:
     rgba: bytes
 
 
+# A UDP receive can report an earlier send's ICMP "port unreachable" as an
+# error: Windows raises ConnectionResetError (WSAECONNRESET, 10054) on the next
+# recvfrom of an unconnected socket, other systems ConnectionRefusedError on a
+# connected one. The socket is fine; the receive loops treat it as transient
+# (remotex hit this on Windows the moment the Mac opened its streams).
+_UDP_TRANSIENT_ERRORS = (ConnectionResetError, ConnectionRefusedError)
+
+
+def _disable_udp_connreset(sock: socket.socket) -> None:
+    """Windows: stop ICMP port-unreachable replies from surfacing as
+    WSAECONNRESET on later receives (SIO_UDP_CONNRESET off). No-op elsewhere."""
+    ioctl = getattr(sock, "ioctl", None)
+    code = getattr(socket, "SIO_UDP_CONNRESET", None)
+    if ioctl is None or code is None:
+        return
+    try:
+        ioctl(code, False)
+    except OSError as e:
+        log.debug("SIO_UDP_CONNRESET not disabled: %s", e)
+
+
 # Re-offer timing (seconds) after the Mac's message 1, and the fallback after
 # a geometry change that brings no message 1.
 _REOFFER_SETTLE_S = 0.3
@@ -2408,6 +2429,8 @@ class Session:
                 pkt, _addr = sock.recvfrom(65536)
             except socket.timeout:
                 continue
+            except _UDP_TRANSIENT_ERRORS:
+                continue          # an ICMP unreachable reported on receive
             except OSError:
                 return
             self._rx_pkts_video += 1
@@ -3135,6 +3158,8 @@ class Session:
                 pkt, _addr = sock.recvfrom(65536)
             except socket.timeout:
                 continue
+            except _UDP_TRANSIENT_ERRORS:
+                continue          # an ICMP unreachable reported on receive
             except OSError:
                 return
             self._rx_pkts_ctrl += 1
@@ -4811,6 +4836,7 @@ class Session:
         except OSError:
             pass
         s.bind((host, port))
+        _disable_udp_connreset(s)
         return s
 
     @staticmethod
@@ -4895,6 +4921,8 @@ class Session:
                 if into:
                     return
                 continue
+            except _UDP_TRANSIENT_ERRORS:
+                continue          # an ICMP unreachable reported on receive
             except OSError:
                 return
             into.append(pkt)
