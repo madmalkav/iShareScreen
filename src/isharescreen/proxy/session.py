@@ -397,6 +397,8 @@ class Session:
         self._return_to_virtual_pending = False
         self._last_return_t = 0.0
         self._return_tries = 0
+        self._layout_flags: Optional[int] = None
+        self._awaiting_virtual = False
         self._needs_post_layout_fir: bool = False
         # Mid-session 0x1c re-offer, debounced: one offer per burst of the
         # Mac's message 1 / layout events (see `_request_reoffer`).
@@ -1778,6 +1780,8 @@ class Session:
         self._return_to_virtual_pending = False
         self._last_return_t = 0.0
         self._return_tries = 0
+        self._layout_flags: Optional[int] = None
+        self._awaiting_virtual = False
         self._needs_post_layout_fir = False
         self._needs_param_harvest = False
         self._harvest_vps = None
@@ -2085,6 +2089,8 @@ class Session:
                 or len(rects) != 1
                 or os.environ.get("ISS_RETURN_TO_VIRTUAL", "1") == "0"):
             return
+        if self._layout_flags is not None:
+            return        # the layout's flags word says it directly (below)
         did = rects[0].display_id
         now = time.monotonic()
         ours = now - self._last_display_request_t < self._DISPLAY_REQUEST_GRACE_S
@@ -2101,6 +2107,40 @@ class Session:
             "display again", self._current_display_id, did)
         self._current_display_id = did
         self._return_to_virtual_pending = True
+
+    def _note_layout_flags(self, flags: int) -> None:
+        """AppleDisplayLayout header flags (+0x0e, remotex protocol notes):
+        bit 0 the session is on a virtual display, bit 1 the viewer may switch
+        it, bit 2 on console, bit 3 the lock screen, bit 4 the login window
+        (High Performance: 0x5, 0x15 at the login window). A login at the Mac
+        moves the session to the new user's agent, which has only the physical
+        display: bit 0 clears and the stream stops, with no message 1. In
+        curtain mode ask for the virtual display again, and offer once it is
+        back (no message 1 comes for that either)."""
+        prev, self._layout_flags = self._layout_flags, flags
+        if prev is None or prev == flags:
+            return
+        log.info("AppleDisplayLayout flags 0x%x -> 0x%x", prev, flags)
+        cfg = self._config
+        if (not getattr(cfg, "curtain", True) or getattr(cfg, "alt_session", False)
+                or os.environ.get("ISS_RETURN_TO_VIRTUAL", "1") == "0"):
+            return
+        if prev & 1 and not flags & 1:
+            log.warning("the Mac moved the session to its physical display "
+                        "(e.g. a login at the Mac); asking for the virtual "
+                        "display again")
+            self._cancel_reoffer()     # no offer for a display we're leaving
+            self._return_to_virtual_pending = True
+            self._awaiting_virtual = True
+        elif flags & 1 and not prev & 1 and self._awaiting_virtual:
+            self._awaiting_virtual = False
+            self._request_reoffer(_REOFFER_SETTLE_S, "back on the virtual display")
+
+    def _cancel_reoffer(self) -> None:
+        with self._reoffer_lock:
+            t, self._reoffer_timer = self._reoffer_timer, None
+        if t is not None:
+            t.cancel()
 
     def _maybe_return_to_virtual_display(self) -> None:
         """TX loop: send the pending display request (rate-limited)."""
@@ -3388,12 +3428,12 @@ class Session:
         #   [2..3] u16 BE   = body length (= 4 for the heartbeat shape)
         #   [4..5] u16 BE   = client/flags (observed = 1)
         #   [6..7] u16 BE   = cmd          (THIS is the dispatch byte)
-        # cmd values observed:
-        #   12 = MiscStatus heartbeat (every 2.1 s) — fires when the
-        #        viewer's command-mask grants the bit
+        # cmd values (remotex protocol notes, "Other messages"):
+        #   4  = heartbeat (re-pushed every couple of seconds)
         #   2  = remote clipboard changed (autopasteboard generation
         #        bumped) — viewer responds with msg 0x0b fetch
-        #   11 = UserSessionChanged
+        #   11, 12 = the pointer is hidden / shown again
+        #   17 = the Mac's user session changed: a login or a logout
         if msg_type == 0x14:
             cmd = struct.unpack(">H", msg[6:8])[0] if len(msg) >= 8 else None
             # Only log on change — the host re-pushes the same status
@@ -3401,6 +3441,9 @@ class Session:
             if cmd != self._last_misc_status_cmd:
                 log.debug("server sent 0x14 misc-status (cmd=%s): %s", cmd, msg.hex())
                 self._last_misc_status_cmd = cmd
+            if cmd == 17:
+                log.info("the Mac's user session changed (a login or logout at "
+                         "the Mac)")
             if cmd == 2:
                 log.info("remote clipboard changed; sending fetch (0x0b)")
                 try:
@@ -3677,6 +3720,10 @@ class Session:
                                               keep_pending=True)
                     else:
                         self._schedule_post_layout_arm()
+                # Header flags (+0x0e): which kind of display the session is on.
+                if prefix_len >= 0x12:
+                    self._note_layout_flags(struct.unpack(
+                        ">I", msg[offset + 2 + 0x0e:offset + 2 + 0x12])[0])
                 offset += 2 + prefix_len
             else:
                 # A non-cursor, non-config rect on the control channel means

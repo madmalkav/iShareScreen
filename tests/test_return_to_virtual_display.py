@@ -29,6 +29,8 @@ def s(monkeypatch):
     sess._return_to_virtual_pending = False
     sess._last_return_t = 0.0
     sess._return_tries = 0
+    sess._layout_flags = None          # no flags word: the display-id path
+    sess._awaiting_virtual = False
     sent = []
     sess.send_dynamic_resolution = lambda *a: sent.append(a)
     sess.sent = sent
@@ -105,3 +107,64 @@ def test_multi_display_host_untouched(s):
     s._note_display_layout(_rect(91) + _rect(92))
     s._note_display_layout(_rect(1) + _rect(2))
     assert not s._return_to_virtual_pending
+
+
+
+# ── the layout's flags word (bit 0 = on a virtual display) ─────────────
+
+import threading
+
+
+@pytest.fixture
+def f(s):
+    s._reoffer_lock = threading.Lock()
+    s._reoffer_timer = None
+    s.reoffers = []
+    s._request_reoffer = lambda delay, reason, keep_pending=False: s.reoffers.append(reason)
+    return s
+
+
+def test_flags_first_value_only_recorded(f):
+    f._note_layout_flags(0x5)
+    assert f._layout_flags == 0x5 and not f._return_to_virtual_pending
+
+
+def test_flags_switch_to_physical_triggers_return_and_cancels_offer(f):
+    t = threading.Timer(10, lambda: None)
+    f._reoffer_timer = t
+    f._note_layout_flags(0x5)
+    f._note_layout_flags(0x4)                     # login at the Mac
+    assert f._return_to_virtual_pending and f._awaiting_virtual
+    assert f._reoffer_timer is None               # pending offer cancelled
+    f._maybe_return_to_virtual_display()
+    assert f.sent == [(1920, 1080, 2.0)]
+
+
+def test_flags_back_on_virtual_offers_once(f):
+    f._note_layout_flags(0x5)
+    f._note_layout_flags(0x4)
+    f._note_layout_flags(0x5)                     # our 0x1d brought it back
+    assert f.reoffers == ["back on the virtual display"]
+    f._note_layout_flags(0x4)
+    f._note_layout_flags(0x5)
+    assert f.reoffers.count("back on the virtual display") == 2
+
+
+def test_flags_known_disables_display_id_guess(f):
+    f._note_display_layout(_rect(91))
+    f._note_layout_flags(0x5)
+    f._note_display_layout(_rect(1, 5120, 2160))  # id change alone: no guess
+    assert not f._return_to_virtual_pending
+
+
+def test_flags_ignored_without_curtain(f):
+    f._config.curtain = False
+    f._note_layout_flags(0x5)
+    f._note_layout_flags(0x4)
+    assert not f._return_to_virtual_pending
+
+
+def test_login_window_bit_change_is_not_a_switch(f):
+    f._note_layout_flags(0x15)                    # login window, virtual
+    f._note_layout_flags(0x5)                     # logged in, still virtual
+    assert not f._return_to_virtual_pending and not f.reoffers
