@@ -112,6 +112,14 @@ flow), `ISS_TILES_PER_FRAME`, `ISS_NALU_DUMP=<file>` (record HEVC for offline re
 decoder).
 
 ## Tried and dropped (don't retry without a new idea)
+- **Encoder frame rate above 60:** a 120/144 Hz virtual display and the `com.apple.VideoConference` keys
+  `forceVideoStreamFramerate`/`forceEncodeFramerate` (not even read) leave the encoder at 60. ScreensharingAgent decides it:
+  "encoder support 60FPS", "both viewer and server support 60 FPS on stream 1" — a 30/60 capability, nothing above.
+- **Bitrate above 60 Mbit/s:** offer tiers and `forceVideoStreamTxMaxBitrate` change nothing; `forceVideoStreamTxMinBitrate`
+  forces the encoder (min 90/max 100 → ~89 Mbit/s, QP ~20 vs ~25; min 100/max 150 → ~145, QP 12; the RTX 2080's NVDEC and a
+  Ryzen 5 3600 in software both top out ~55–57 fps there). The Mac then starts at full rate, iss loses ~150 packets in its
+  first second, and still areas stay corrupt (no re-encode). The user judged 90–100 Mbit/s not better. Dropped.
+- **H.264 keep-decoding after a loss** (skip the lost picture, go on): heavy smearing and colour shifts. Dropped.
 - **Connected UDP sockets:** on macOS `sendto()` with an address on a connected socket fails (EISCONN; ~12 call sites), and ICMP
   unreachables become receive errors; the gain is marginal.
 - **Lossless framebuffer path** (zlib/CopyRect instead of video): works, but the host delivers only ~4–8 fps for a changing
@@ -140,3 +148,10 @@ decoder).
 7. **Free-threaded Python 3.14t:** iss runs headless on it with the GIL off (every dependency has a 3.14t wheel except
    `aioquic`, so no browser frontend). On the RTX 2080 box it saved ~4 % CPU and gained no fps: iss's Python threads total
    ~45–60 % of a core (CUDA or software decode), so the GIL isn't a bottleneck there. Measure on a slow CPU before supporting it.
+8. **H.264 loss repair by refresh pictures** (prototype `~/claude/iss-tools/avc-refresh-prototype-2026-10-14.patch`, not in the
+   repo): the Mac accepts LTR for H.264 (answer `ltrpEnabled = 1` when the 123 bank carries `LTR;`), takes APP name 5 acks with
+   the RTP timestamp and PSFB FMT 2 requests, and marks refresh pictures with RTP extension profile `0x9321` (bit `0x0020`,
+   as HEVC's `0x9331`). Pictures decode clean, but on 1-tile streams recovery pictures come at most once a second, so it gains
+   little over keyframes; the real lever on lossy links is fewer packets per picture (`--max-bitrate`). Low priority.
+9. **Display-side latency** (render, vsync): iss's own pipeline adds ~3 ms p50 / ~9 ms p95 (`ISS_LAT_TRACE=1`); the
+   desktop window's part is unmeasured (needs a desktop session).
