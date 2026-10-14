@@ -104,7 +104,10 @@ guide is the README's "Codecs and decoders" section.
 #8 Wayland window size · #9 GPU-kept HW frames · #10 visible H.264 fallback · #11 CUDA first on NVIDIA · #12 window fits screen ·
 #13 `--cursor video` · #14 `--hwaccel` + measured H.264 fallback + README guide · #15 macOS HW 4:4:4 probe · #16 `shown_rates` ·
 #17 README Intel Mac H.264 · #18 clean Ctrl-C · #19 README bitrate note · #20 RCTL · #21 live SSRC adoption · #22 RTCP per leg ·
-#23 RTCP demux · #24 1×1 resize request · #25 RTCP liveness.
+#23 RTCP demux · #24 1×1 resize request · #25 RTCP liveness · #26/#28/#34/#38/#42/#43 docs · #29 control-message record split ·
+#30 one offer per message 1 + re-offer on wake · #31 `--max-bitrate` · #32 `--refresh-rate` · #33 800×600-point minimum ·
+#35 Windows UDP CONNRESET · #36 no NACKs/retransmit wait · #37 return to virtual display (layout flags) · #39 `ISS_LAT_TRACE` ·
+#40 faster connect · #41 precise scroll `0x17`. Open: #27 (AVC backlog guard for slow viewers, parked).
 
 Useful env switches: `ISS_HWACCEL`, `ISS_HW_SLOW_FALLBACK=0`, `ISS_PREFER_CUDA=0`, `ISS_HW_FRAMES_ON_GPU`, `ISS_RCTL=0`,
 `ISS_RCTL_BWE_KBPS`, `ISS_VIDEO_RTCP_ON_CTRL=1` (old routing), `ISS_OFFER_RESEND=1` + `ISS_REOFFER_ON_MSG1=0` (old offer
@@ -131,10 +134,13 @@ decoder).
 
 ## Open topics
 1. **Encoder frame rate above 60:** settled — not possible (see Tried and dropped).
-2. **Host switching to its physical display** on a local login during a curtain session: #37 re-requests the virtual
-   display when the layout header flags (+0x0e) lose bit 0 (virtual), per [REMOTEX] rfc §8.4; flags 0x5 in curtain mode
-   verified on the M4. Still needs a live check with a real local login at the Mac. (Branches `fix/return-to-virtual-display`
-   and `fix/hide-startup-gray` were superseded / not needed and are deleted.)
+2. **Host switching to its physical display** on a login at the Mac during a curtain session: #37 re-requests the
+   virtual display when the layout header flags (+0x0e) lose bit 0 (virtual), retrying every 15 s (3 tries per switch) while
+   they stay physical, and offers once bit 0 is back ([REMOTEX] rfc §8.4). iss runs High Performance, which sends `0x5` (Standard
+   sends `0x4`, bit 0 clear); `0x5` was verified on the M4. Still needs a live check with a real login at the Mac. Per the notes,
+   some logins make the agent **close the connection** instead (not handled; it isn't a #37 failure), and unlocking or waking
+   changes nothing. Once the flags word is known, the older display-id guess is off, so a switch that keeps bit 0 set (e.g. the
+   old "long idle" report, never reproduced) would go unnoticed; watch for it.
 3. **Software decode cost after RCTL:** at ~56 Mbit/s, 4K60 HEVC software decode needs ~6 cores. Weak CPUs rely on the
    delay feedback to make the host back off; not measured on a weak machine.
 4. **RCTL's second byte:** meaning unknown, sent as 0 (accepted). The loss bits and BWE add nothing (see facts above).

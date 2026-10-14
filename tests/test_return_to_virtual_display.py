@@ -31,6 +31,7 @@ def s(monkeypatch):
     sess._return_tries = 0
     sess._layout_flags = None          # no flags word: the display-id path
     sess._awaiting_virtual = False
+    sess._reoffer_when_virtual = False
     sent = []
     sess.send_dynamic_resolution = lambda *a: sent.append(a)
     sess.sent = sent
@@ -168,3 +169,67 @@ def test_login_window_bit_change_is_not_a_switch(f):
     f._note_layout_flags(0x15)                    # login window, virtual
     f._note_layout_flags(0x5)                     # logged in, still virtual
     assert not f._return_to_virtual_pending and not f.reoffers
+
+
+def _later(f, s=100):
+    """Pretend the cooldown and the display-request grace have passed."""
+    f._last_return_t -= s
+    f._last_display_request_t -= s
+
+
+def test_flags_retry_while_still_physical(f):
+    f._note_layout_flags(0x5)
+    f._note_layout_flags(0x4)
+    f._maybe_return_to_virtual_display()
+    assert len(f.sent) == 1
+    f._maybe_return_to_virtual_display()          # cooldown: nothing yet
+    assert len(f.sent) == 1
+    for _ in range(5):
+        _later(f)
+        f._maybe_return_to_virtual_display()
+    assert len(f.sent) == 3                       # capped
+    f._note_layout_flags(0x5)
+    assert f.reoffers == ["back on the virtual display"]
+    _later(f)
+    f._maybe_return_to_virtual_display()          # back: no more requests
+    assert len(f.sent) == 3
+
+
+def test_flags_tries_reset_per_switch(f):
+    f._note_layout_flags(0x5)
+    for _ in range(5):                            # five logins at the Mac
+        f._note_layout_flags(0x4)
+        _later(f)
+        f._maybe_return_to_virtual_display()
+        f._note_layout_flags(0x5)
+    assert len(f.sent) == 5
+    assert f.reoffers.count("back on the virtual display") == 5
+
+
+def test_flags_first_value_physical_asks_after_grace(f):
+    f._last_display_request_t = time.monotonic()  # just connected
+    f._note_layout_flags(0x4)
+    f._maybe_return_to_virtual_display()
+    assert f.sent == []                           # within the grace
+    _later(f)
+    f._maybe_return_to_virtual_display()
+    assert f.sent == [(1920, 1080, 2.0)]
+    f._note_layout_flags(0x5)
+    assert f.reoffers == ["back on the virtual display"]
+
+
+def test_flags_first_value_physical_passing_costs_nothing(f):
+    f._last_display_request_t = time.monotonic()
+    f._note_layout_flags(0x4)
+    f._note_layout_flags(0x5)                     # the host settled by itself
+    _later(f)
+    f._maybe_return_to_virtual_display()
+    assert f.sent == [] and f.reoffers == []
+
+
+def test_flags_first_value_physical_ignored_without_curtain(f):
+    f._config.curtain = False
+    f._note_layout_flags(0x4)
+    _later(f)
+    f._maybe_return_to_virtual_display()
+    assert f.sent == []

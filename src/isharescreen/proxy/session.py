@@ -463,6 +463,7 @@ class Session:
         self._return_tries = 0
         self._layout_flags: Optional[int] = None
         self._awaiting_virtual = False
+        self._reoffer_when_virtual = False
         self._needs_post_layout_fir: bool = False
         # Mid-session 0x1c re-offer, debounced: one offer per burst of the
         # Mac's message 1 / layout events (see `_request_reoffer`).
@@ -1856,6 +1857,7 @@ class Session:
         self._return_tries = 0
         self._layout_flags: Optional[int] = None
         self._awaiting_virtual = False
+        self._reoffer_when_virtual = False
         self._needs_post_layout_fir = False
         self._needs_param_harvest = False
         self._harvest_vps = None
@@ -2144,12 +2146,12 @@ class Session:
         log.info("libav concealment-log handler installed (root handlers filter the noise)")
 
     # Return to the virtual display. In curtain mode the host streams a
-    # virtual display it created for us; but on some console transitions
-    # (the user logging in or unlocking at the Mac, or the Mac waking) it
-    # silently switches the session to its PHYSICAL display (e.g. #1 at
-    # 5120x2160) — a size the viewer never asked for, which overloaded
-    # decoding. Re-sending our display request (what a window resize does
-    # manually) moves it back to a fresh virtual display.
+    # virtual display it created for us; but a login at the Mac moves the
+    # session to its PHYSICAL display (e.g. #1 at 5120x2160) — a size the
+    # viewer never asked for, which overloaded decoding. (Unlocking and
+    # waking change no user session and keep the virtual display, per the
+    # remotex notes.) Re-sending our display request (what a window resize
+    # does manually) moves it back to a fresh virtual display.
     _DISPLAY_REQUEST_GRACE_S: float = 10.0
     _RETURN_TO_VIRTUAL_COOLDOWN_S: float = 15.0
     _RETURN_TO_VIRTUAL_MAX_TRIES: int = 3
@@ -2192,12 +2194,22 @@ class Session:
         curtain mode ask for the virtual display again, and offer once it is
         back (no message 1 comes for that either)."""
         prev, self._layout_flags = self._layout_flags, flags
-        if prev is None or prev == flags:
+        if prev == flags:
+            return
+        cfg = self._config
+        active = (getattr(cfg, "curtain", True) and not getattr(cfg, "alt_session", False)
+                  and os.environ.get("ISS_RETURN_TO_VIRTUAL", "1") != "0")
+        if prev is None:
+            if active and not flags & 1:
+                # Not seen live: a session that starts on the physical
+                # display. The TX loop asks for the virtual one only if it
+                # is still physical after the display-request grace, so a
+                # passing first layout costs nothing.
+                log.info("AppleDisplayLayout flags 0x%x: not on a virtual display", flags)
+                self._awaiting_virtual = True
             return
         log.info("AppleDisplayLayout flags 0x%x -> 0x%x", prev, flags)
-        cfg = self._config
-        if (not getattr(cfg, "curtain", True) or getattr(cfg, "alt_session", False)
-                or os.environ.get("ISS_RETURN_TO_VIRTUAL", "1") == "0"):
+        if not active:
             return
         if prev & 1 and not flags & 1:
             log.warning("the Mac moved the session to its physical display "
@@ -2206,9 +2218,16 @@ class Session:
             self._cancel_reoffer()     # no offer for a display we're leaving
             self._return_to_virtual_pending = True
             self._awaiting_virtual = True
+            self._reoffer_when_virtual = True
+            self._return_tries = 0     # a new switch: a fresh set of tries
         elif flags & 1 and not prev & 1 and self._awaiting_virtual:
             self._awaiting_virtual = False
-            self._request_reoffer(_REOFFER_SETTLE_S, "back on the virtual display")
+            self._return_tries = 0
+            # No message 1 comes for this return; offer unless nothing has
+            # stopped (a passing first layout we never acted on).
+            if self._reoffer_when_virtual:
+                self._reoffer_when_virtual = False
+                self._request_reoffer(_REOFFER_SETTLE_S, "back on the virtual display")
 
     def _cancel_reoffer(self) -> None:
         with self._reoffer_lock:
@@ -2217,10 +2236,18 @@ class Session:
             t.cancel()
 
     def _maybe_return_to_virtual_display(self) -> None:
-        """TX loop: send the pending display request (rate-limited)."""
-        if not self._return_to_virtual_pending:
-            return
+        """TX loop: send the pending display request (rate-limited). While
+        the layout flags still say physical, ask again after the cooldown
+        (up to the try limit) — one request may land while the host is
+        still settling."""
         now = time.monotonic()
+        if not self._return_to_virtual_pending:
+            if not (self._awaiting_virtual and self._layout_flags is not None
+                    and not self._layout_flags & 1
+                    and self._return_tries < self._RETURN_TO_VIRTUAL_MAX_TRIES
+                    and now - self._last_display_request_t >= self._DISPLAY_REQUEST_GRACE_S):
+                return
+            self._return_to_virtual_pending = True
         if now - self._last_return_t < self._RETURN_TO_VIRTUAL_COOLDOWN_S:
             return
         self._return_to_virtual_pending = False
@@ -2236,6 +2263,7 @@ class Session:
             return
         self._last_return_t = now
         self._return_tries += 1
+        self._reoffer_when_virtual = True
         try:
             self.send_dynamic_resolution(*req)
         except Exception as e:
