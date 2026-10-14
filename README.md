@@ -213,6 +213,17 @@ an API with `--hwaccel`, to keep hardware.
   ceiling, and a cap below 20 makes it encode at the cap. Example: software
   H.264 on a single CPU core fell behind by thousands of packets at the default
   ~39 Mbit/s and kept up with `--max-bitrate 8`. Fine detail softens at low caps.
+- **The picture keeps freezing for a second or more on Wi-Fi or another lossy
+  link, especially with H.264:** the Mac never resends a lost packet, so every
+  picture that loses one is dropped and the picture waits for a fresh keyframe,
+  which the Mac sends at most once a second. At 4K an H.264 picture spans about a
+  hundred packets, so even light loss damages many of them: with 0.1 % of
+  packets lost, a 4K H.264 session showed only 170–330 of ~960 pictures in 40 s.
+  Lower the bitrate so each picture is fewer packets: with `--max-bitrate 8`
+  the same loss showed about 800. A smaller `--advertise` helps the same way.
+  HEVC (`--codec hevc`, where your hardware decodes it) copes much better,
+  because the Mac sends it in four strips and each loss costs only one. Loss
+  above about 0.5 % is beyond any setting; use a wired connection.
 - **Text is blurry for a moment after scrolling, then sharpens:** the Mac's
   encoder is short of bits. The Mac adapts its video bitrate (between 20 and
   60 Mbit/s) to the viewer's rate-control reports, which iss sends like Apple's
