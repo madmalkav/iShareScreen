@@ -225,6 +225,16 @@ def build_viewer_info(
     return head + command_mask + extra
 
 
+# Smallest virtual display to ask the Mac for, in points (logical size), at 1x
+# or 2x alike: the least Apple's own viewer asks for (its window goes no
+# smaller). Below it the Mac can send no picture at all: some heights are too
+# low for its four strips (encoder error -12902, e.g. 90 rows), and at 2x it
+# substitutes a display of its own and its capture loses it (remotex protocol
+# notes, "The High Performance virtual display").
+MIN_DISPLAY_W = 800
+MIN_DISPLAY_H = 600
+
+
 def build_virtual_display(
     *,
     width: int,

@@ -44,6 +44,7 @@ from aioquic.h3.events import (
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.events import ProtocolNegotiated, QuicEvent
 
+from ...proxy.protocol.rfb import MIN_DISPLAY_H, MIN_DISPLAY_W
 from ...proxy.session import Session, SessionConfig
 from ...proxy.media.avc_nalu import au_is_keyframe, au_has_sps
 from ...proxy.media.avc import _patch_avc_sps_dpb
@@ -1443,8 +1444,8 @@ class WebTransportBridge:
         no server-side throttle is needed beyond ignoring an unchanged size."""
         if not self._config.dynamic_resolution:
             return  # fixed --advertise: respect the user's explicit resolution
-        w = max(640, min(3840, w & ~1))
-        h = max(480, min(2160, h & ~1))
+        w = max(MIN_DISPLAY_W, min(3840, w & ~1))
+        h = max(MIN_DISPLAY_H, min(2160, h & ~1))
         if (w, h) == getattr(self, "_last_resize_wh", None):
             return
         self._last_resize_wh = (w, h)

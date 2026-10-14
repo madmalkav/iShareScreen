@@ -40,6 +40,7 @@ faulthandler.enable()
 
 from . import __version__
 from .proxy.protocol.negotiation import AdvertiseDims
+from .proxy.protocol.rfb import MIN_DISPLAY_H, MIN_DISPLAY_W
 from .proxy.session import Session, SessionConfig
 
 
@@ -335,7 +336,15 @@ def _parse_advertise(spec: Optional[str]) -> Optional[AdvertiseDims]:
         raise SystemExit(
             f"invalid --advertise value {spec!r}: expected 'WxH' or 'WxH@HIDPI' ({e})"
         ) from e
+    if width < MIN_DISPLAY_W or height < MIN_DISPLAY_H:
+        # Same floor as the viewers' resize paths (see rfb.MIN_DISPLAY_W):
+        # below it the Mac can send no picture at all.
+        nw, nh = max(width, MIN_DISPLAY_W), max(height, MIN_DISPLAY_H)
+        print(f"iss: --advertise {width}x{height} is below the {MIN_DISPLAY_W}x"
+              f"{MIN_DISPLAY_H} minimum; using {nw}x{nh}", file=sys.stderr)
+        width, height = nw, nh
     return AdvertiseDims(width=width, height=height, hidpi_scale=hidpi)
+
 
 
 def _password_from_args(args: argparse.Namespace) -> Optional[str]:

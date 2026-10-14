@@ -20,6 +20,7 @@ import glfw
 import wgpu
 
 from ...proxy.protocol.negotiation import AdvertiseDims
+from ...proxy.protocol.rfb import MIN_DISPLAY_H, MIN_DISPLAY_W
 from ...proxy.session import Session, SessionConfig
 from .audio_sink import make_audio_sink
 from .canvas import WaylandSafeCanvas, fit_size, fit_window_to_screen, lock_aspect, usable_screen_area
@@ -56,7 +57,7 @@ _FRESH_TILE_WAIT_S = 0.005
 _RESIZE_DEBOUNCE_S = 0.5        # window must hold a new size this long
 _RESIZE_MIN_DELTA_PX = 32       # ignore sub-threshold jitter on either axis
 _RESIZE_MIN_INTERVAL_S = 2.5    # floor between consecutive resize requests
-_MIN_ADVERTISE_W = 640
+_MIN_ADVERTISE_W = MIN_DISPLAY_W   # smallest request, in points (see rfb)
 
 # Scroll-wheel: base amplification applied to EVERY scroll (on top of the
 # speed-based curve below). Each `tick` becomes one wheel press/release pair,
@@ -67,7 +68,7 @@ _MIN_ADVERTISE_W = 640
 # which reads as "the tick didn't register" on a slow scroll (few px) while a
 # fast flick accumulates enough px to feel like it works.
 _WHEEL_MULT = 12.0
-_MIN_ADVERTISE_H = 480
+_MIN_ADVERTISE_H = MIN_DISPLAY_H
 _MAX_ADVERTISE_W = 1920  # server backing 3840 / mode-table ratio 2
 _MAX_ADVERTISE_H = 1080
 
