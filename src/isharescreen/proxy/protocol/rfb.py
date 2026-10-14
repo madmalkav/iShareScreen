@@ -11,6 +11,7 @@ bit 2 is middle, swapped from the RFC.
 from __future__ import annotations
 
 import socket
+import os
 import struct
 import time
 from dataclasses import dataclass
@@ -136,7 +137,7 @@ def do_protocol_handshake(sock: socket.socket) -> bytes:
     return recv_exact(sock, nt)
 
 
-def warmup_tcp(host: str, port: int, *, dwell_seconds: float = 1.4) -> None:
+def warmup_tcp(host: str, port: int, *, dwell_seconds: Optional[float] = None) -> None:
     """Apple Screen Sharing's pre-session TCP probe (the first of two TCPs).
 
     Open, exchange the ProtocolVersion banner, drop. Completing the version
@@ -161,6 +162,12 @@ def warmup_tcp(host: str, port: int, *, dwell_seconds: float = 1.4) -> None:
         except OSError:
             pass
         sock.close()
+    # The dwell was copied from Apple's viewer (~1.4 s); its claimed benefit
+    # (surviving lock/login transitions) was never verified, and the remotex
+    # client opens no warm-up connection at all. It added 1.4 s to every
+    # connect. ISS_WARMUP_DWELL_S restores it.
+    if dwell_seconds is None:
+        dwell_seconds = float(os.environ.get("ISS_WARMUP_DWELL_S", "0"))
     if dwell_seconds > 0:
         time.sleep(dwell_seconds)
 

@@ -385,7 +385,7 @@ def _read_ss_prompt(sock: socket.socket) -> Optional[tuple[int, str]]:
     return flags, console_user
 
 
-def _peek_ss_prompt(sock: socket.socket, wait: float = 2.0) -> bool:
+def _peek_ss_prompt(sock: socket.socket, wait: Optional[float] = None) -> bool:
     """Non-destructively test whether the daemon appended a SessionSelect
     prompt after ServerInit. The daemon emits it only when the auth user ≠
     the console user (i.e. someone else is logged in), so its presence is the
@@ -393,7 +393,13 @@ def _peek_ss_prompt(sock: socket.socket, wait: float = 2.0) -> bool:
 
     Uses MSG_PEEK: when a prompt is absent (the auth user IS the console
     user), the next bytes stay in the socket buffer for the normal
-    post-ServerInit handshake, so always calling this is safe."""
+    post-ServerInit handshake, so always calling this is safe.
+
+    The prompt comes appended to ServerInit, so a short wait is enough; in
+    the common case (no prompt) the whole wait is spent for nothing.
+    ISS_SS_PROMPT_WAIT_S overrides it (was 2 s)."""
+    if wait is None:
+        wait = float(os.environ.get("ISS_SS_PROMPT_WAIT_S", "0.5"))
     sock.settimeout(wait)
     try:
         peek = sock.recv(4, socket.MSG_PEEK)
@@ -506,6 +512,16 @@ def _phase_session_select(
 
 # ── phase 3: pre-toggle plaintext + enc1103 setup ─────────────────────
 
+def _opening_encodings() -> tuple[int, ...]:
+    """The first (plaintext) SetEncodings. Apple's viewer leaves the media
+    stream encoding 1010 out of it and appends 1010 only in the second,
+    encrypted one, so the Mac sends a single message 1 (it sends one per
+    SetEncodings naming 1010). ISS_FAST_CONNECT=0 keeps the old list."""
+    if os.environ.get("ISS_FAST_CONNECT", "1") == "0":
+        return HP_ENCODINGS_FULL
+    return tuple(e for e in HP_ENCODINGS_FULL if e != 1010)
+
+
 def _phase_handshake_plaintext(
     sock: socket.socket, advertise: AdvertiseDims, hdr: bool, curtain: bool,
     refresh_hz: float = 60.0,
@@ -542,20 +558,37 @@ def _phase_handshake_plaintext(
     else:
         log.info("curtain=off — skipping SetDisplayConfiguration; "
                  "host's physical screen will mirror the stream")
-    sock.sendall(build_set_encodings(HP_ENCODINGS_FULL))
+    sock.sendall(build_set_encodings(_opening_encodings()))
 
 
 def _phase_enable_enc1103(
     sock: socket.socket, ecb_key: bytes, *, first_byte_timeout: float = 10.0,
+    on_cipher_ready: Optional[Callable[[], None]] = None,
 ) -> tuple[StreamCipher, list[bytes]]:
     """Drain framebuffer-update messages until we see the 1103 encoding entry,
     build a `StreamCipher` from its 36-byte body, then send the
     PostEncryptionToggle and drain pending traffic so the cipher's receive
     counter stays aligned with the server."""
-    cipher = _read_until_enc1103(sock, ecb_key, first_byte_timeout=first_byte_timeout)
+    cipher, tail, have_msg1 = _read_until_enc1103(
+        sock, ecb_key, first_byte_timeout=first_byte_timeout)
     sock.sendall(build_post_encryption_toggle())
-    time.sleep(_POST_TOGGLE_SETTLE_S)
-    drained = _drain_through_cipher(sock, cipher, timeout=0.5)
+    if on_cipher_ready is not None:
+        try:
+            on_cipher_ready()
+        except Exception as e:
+            log.debug("on_cipher_ready raised: %s", e)
+    if os.environ.get("ISS_FAST_CONNECT", "1") == "0":       # old timing
+        time.sleep(_POST_TOGGLE_SETTLE_S)
+        if tail:
+            cipher.decrypt_stream(tail)
+        drained = _drain_through_cipher(sock, cipher, timeout=0.5)
+    else:
+        # The encrypted SetEncodings (the first one to name 1010, see
+        # `_opening_encodings`) goes out at once; the Mac answers it with
+        # message 1, which the offer must follow.
+        sock.sendall(cipher.encrypt_message(build_set_encodings(HP_ENCODINGS_FULL)))
+        drained = _drain_until_message1(sock, cipher, initial=tail,
+                                        have_msg1=have_msg1)
     return cipher, drained
 
 
@@ -646,7 +679,9 @@ def _phase_media_offer(
     they're silently dropped — the cipher's stream state is consumed by
     decrypt and the bytes can't be re-read off the socket.
     """
-    sock.sendall(cipher.encrypt_message(build_set_encodings(HP_ENCODINGS_FULL)))
+    if os.environ.get("ISS_FAST_CONNECT", "1") == "0":
+        # (fast path: already sent right after the cipher started)
+        sock.sendall(cipher.encrypt_message(build_set_encodings(HP_ENCODINGS_FULL)))
 
     keys = random_negotiation_keys()
     msg_1c = build_0x1c(audio_offer, video_offer, keys, alt_session=alt_session)
@@ -715,6 +750,7 @@ def connect_and_negotiate(
     alt_session: bool = False,
     on_session_choice=None,   # callable () -> "share_console" | "alt_session"
     recorder=None,
+    on_cipher_ready: Optional[Callable[[], None]] = None,
 ) -> NegotiationResult:
     """Drive the full handshake. The returned socket is in encrypted-RFB
     mode; subsequent control-channel sends must wrap with
@@ -831,7 +867,8 @@ def connect_and_negotiate(
         _phase_handshake_plaintext(sock, advertise, hdr, curtain=curtain,
                                    refresh_hz=refresh_hz)
 
-    cipher, drained = _phase_enable_enc1103(sock, ecb_key)
+    cipher, drained = _phase_enable_enc1103(sock, ecb_key,
+                                            on_cipher_ready=on_cipher_ready)
     # The display layout arriving here gives the canvas if the answer
     # doesn't (see `_await_video_answer`).
     layout_backing = next(
@@ -860,63 +897,89 @@ def connect_and_negotiate(
 
 # ── helpers ──────────────────────────────────────────────────────────
 
-def _read_until_enc1103(
-    sock: socket.socket, ecb_key: bytes, *, first_byte_timeout: float = 10.0,
-) -> StreamCipher:
-    """Buffer recv until we see a 1103 encoding entry, then construct a
-    `StreamCipher` from its 36-byte body. Tolerates 0x14 UserSessionChanged
-    notifications that can interleave with the ServerInit reply burst.
-
-    The default `first_byte_timeout` of 10 s covers a normal handshake.
-    Share-console / alt-session flows wait for the SessionSelect prompt
-    earlier in `_phase_session_select`, so by the time we get here the
-    connection is already past any human-confirm gate.
-    """
-    sock.settimeout(1.0)
-    init = bytearray()
-    deadline = time.monotonic() + first_byte_timeout
-    while time.monotonic() < deadline:
-        try:
-            chunk = sock.recv(65536)
-            if not chunk:
-                break
-            init += chunk
-        except socket.timeout:
-            if init:
-                break
-    sock.settimeout(15)
-
+def _scan_for_enc1103(
+    init: bytes, ecb_key: bytes, media: Optional[list] = None,
+) -> tuple[Optional[StreamCipher], int, bool]:
+    """Parse the plaintext reply burst for the 1103 encoding entry.
+    Returns (cipher, end of the parsed FramebufferUpdate, complete). `complete`
+    is False while the burst so far ends inside a message the cipher depends
+    on (read more and scan again)."""
     pos = 0
     cipher: Optional[StreamCipher] = None
     while pos < len(init):
         b = init[pos]
-        if b == 0x14 and pos + 8 <= len(init):
+        if b == 0x14:
+            if pos + 8 > len(init):
+                return None, pos, False
             pos += 8
             continue
-        if b == 0x00 and pos + 4 <= len(init):
+        if b == 0x00:
+            if pos + 4 > len(init):
+                return None, pos, False
             n_rects = struct.unpack(">H", init[pos + 2:pos + 4])[0]
             p = pos + 4
             for _ in range(n_rects):
                 if p + 12 > len(init):
-                    break
+                    return cipher, p, cipher is not None
                 enc = struct.unpack(">i", init[p + 8:p + 12])[0]
                 p += 12
-                if enc == 1103 and p + 36 <= len(init):
+                if enc == 1103:
+                    if p + 36 > len(init):
+                        return None, p, False
                     cipher = StreamCipher(bytes(init[p:p + 36]), ecb_key=ecb_key)
                     p += 36
-                elif enc in (1010, 1011) and p + 2 <= len(init):
+                elif enc in (1010, 1011):
+                    if p + 2 > len(init):
+                        return cipher, p, cipher is not None
                     sz = struct.unpack(">H", init[p:p + 2])[0]
+                    if p + 2 + sz > len(init):
+                        return cipher, p, cipher is not None
                     if enc == 1010:
                         m = parse_media_body(bytes(init[p + 2:p + 2 + sz]))
-                        if m is not None:
-                            log.info("media stream (plaintext): %s", m.describe())
+                        if m is not None and media is not None:
+                            media.append(m)
                     p += 2 + sz
                 else:
                     break
-            pos = p
-            break
+            return cipher, p, cipher is not None
         break
+    return cipher, pos, cipher is not None
 
+
+def _read_until_enc1103(
+    sock: socket.socket, ecb_key: bytes, *, first_byte_timeout: float = 10.0,
+) -> tuple[StreamCipher, bytes, bool]:
+    """Read the plaintext reply burst until the 1103 encoding entry is in,
+    then build the `StreamCipher` from its 36-byte body. Returns the cipher
+    and the bytes after the parsed message (already encrypted records), which
+    the caller feeds to the cipher before reading on. Tolerates 0x14
+    UserSessionChanged notifications interleaved with the burst.
+
+    Stops as soon as the entry is complete instead of waiting for the burst
+    to go quiet (that wait cost ~1 s per connect)."""
+    sock.settimeout(1.0)
+    init = bytearray()
+    deadline = time.monotonic() + first_byte_timeout
+    cipher: Optional[StreamCipher] = None
+    pos = 0
+    while time.monotonic() < deadline:
+        try:
+            chunk = sock.recv(65536)
+        except socket.timeout:
+            if init:
+                break
+            continue
+        if not chunk:
+            break
+        init += chunk
+        cipher, pos, complete = _scan_for_enc1103(bytes(init), ecb_key)
+        if cipher is not None and complete:
+            break
+    sock.settimeout(15)
+    media: list = []
+    cipher, pos, _ = _scan_for_enc1103(bytes(init), ecb_key, media)
+    for m in media:
+        log.info("media stream (plaintext): %s", m.describe())
     if cipher is None:
         sock.close()
         raise RuntimeError(
@@ -924,11 +987,54 @@ def _read_until_enc1103(
             "on the server — wait 10-15 seconds and retry."
         )
     log.info("enc1103 OK")
+    return cipher, bytes(init[pos:]), any(m.kind == 1 for m in media)
 
-    if pos < len(init):
-        tail, _ = cipher.decrypt_stream(bytes(init[pos:]))
-        _log_media_msgs(tail, "enc1103 tail")
-    return cipher
+
+def _drain_until_message1(
+    sock: socket.socket, cipher: StreamCipher, *, initial: bytes = b"",
+    max_wait: float = 3.0, have_msg1: bool = False,
+) -> list[bytes]:
+    """Decrypt what the Mac sends after the cipher starts until its message 1
+    (the media ports) has arrived and no record is cut in half, or `max_wait`
+    s. The Mac answers an offer only after message 1 (~1.6 s after the cipher
+    starts on a macOS 27.2 host), and Apple's viewer offers only once message
+    1 is in (remotex notes), so the offer waits for it. Keeps partial records
+    across reads so the cipher stays aligned."""
+    buf = bytearray(initial)
+    msgs: list[bytes] = []
+    seen_msg1 = have_msg1
+    quiet = 0.25
+    deadline = time.monotonic() + max_wait
+    try:
+        while True:
+            if buf:
+                more, consumed = cipher.decrypt_stream(bytes(buf))
+                del buf[:consumed]
+                for m in more:
+                    msgs.append(m)
+                    if any(x.kind == 1 for x in iter_fbu_media_msgs(m)):
+                        seen_msg1 = True
+            if seen_msg1 and not buf:
+                break
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            sock.settimeout(min(quiet, left))
+            try:
+                chunk = sock.recv(65536)
+            except socket.timeout:
+                if seen_msg1 and not buf:
+                    break
+                continue
+            if not chunk:
+                break
+            buf += chunk
+    finally:
+        sock.settimeout(15)
+    if buf:
+        log.warning("drain: %d bytes of a partial record left", len(buf))
+    _log_media_msgs(msgs, "drain")
+    return msgs
 
 
 def _log_media_msgs(msgs: list[bytes], where: str) -> None:

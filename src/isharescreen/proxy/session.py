@@ -263,9 +263,28 @@ def _disable_udp_connreset(sock: socket.socket) -> None:
 # ISS_LAT_TRACE=1: log per-stage picture latency every 5 s (diagnostic).
 _LAT_TRACE = os.environ.get("ISS_LAT_TRACE") == "1"
 
+def _warm_decoder_probe() -> None:
+    """Run the hardware-decode probe (~0.5 s, cached) in the background while
+    the handshake waits for the Mac's message 1 (~1.6 s of idle time), so the
+    decoder can be built at once after the answer. Started after the login,
+    which is CPU-heavy Python the probe would otherwise slow down."""
+    if os.environ.get("ISS_FAST_CONNECT", "1") == "0":
+        return
+
+    def _run() -> None:
+        try:
+            from .media.hwcaps import hevc444_decode_method
+            hevc444_decode_method()
+        except Exception as e:
+            log.debug("decoder probe warm-up failed: %s", e)
+    threading.Thread(target=_run, name="iss-probe-warmup", daemon=True).start()
+
+
 # Re-offer timing (seconds) after the Mac's message 1, and the fallback after
 # a geometry change that brings no message 1.
 _REOFFER_SETTLE_S = 0.3
+# Video packets this recent at that point mean the stream is still running.
+_STREAMING_RECENT_S = 0.25
 _REOFFER_FALLBACK_S = 1.0
 # A burst-drain read that waited this long means the socket's backlog is
 # drained (buffered packets come back in microseconds).
@@ -1546,6 +1565,7 @@ class Session:
             alt_session=cfg.alt_session,
             on_session_choice=cfg.on_session_choice,
             recorder=self._recorder,
+            on_cipher_ready=_warm_decoder_probe,
         )
 
         # Persist the post-auth transport key next to the pcap (sibling
@@ -3535,7 +3555,8 @@ class Session:
                         # both legs and restarts them only for a new offer.
                         if (_m.kind == 1 and not self._replaying_leftovers
                                 and _reoffer_on_message1()):
-                            self._request_reoffer(_REOFFER_SETTLE_S, "message 1")
+                            self._request_reoffer(_REOFFER_SETTLE_S, "message 1",
+                                                  unless_streaming=True)
                         elif _m.kind == 3:
                             log.warning("media stream: the Mac reported an error: %s",
                                         _m.describe())
@@ -3736,7 +3757,8 @@ class Session:
                 pass
 
     def _request_reoffer(self, delay_s: float, reason: str, *,
-                         keep_pending: bool = False) -> None:
+                         keep_pending: bool = False,
+                         unless_streaming: bool = False) -> None:
         """Re-offer the media session after `delay_s`, once. A later request
         replaces a pending one (so a burst of layouts + message 1 yields one
         offer), unless `keep_pending` and one is already scheduled."""
@@ -3753,6 +3775,16 @@ class Session:
                         return
                     self._reoffer_timer = None
                 if self._stop_evt.is_set():
+                    return
+                if unless_streaming and (time.monotonic()
+                                         - getattr(self, "_last_video_pkt_t", 0.0)
+                                         < _STREAMING_RECENT_S):
+                    # A display change stops both legs before the Mac sends
+                    # message 1; pictures still arriving mean this message 1
+                    # answers our own SetEncodings (one per SetEncodings
+                    # naming 1010), and an offer would only restart the stream.
+                    log.info("media stream: %s while the stream is running "
+                             "(answers our SetEncodings); no re-offer", reason)
                     return
                 log.info("re-offering the media stream (%s)", reason)
                 self._schedule_post_layout_arm()

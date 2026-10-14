@@ -59,13 +59,13 @@ guide is the README's "Codecs and decoders" section.
 - **4 tiles:** Apple's default `tilesPerFrame=4` = 4 horizontal strips = 4 consecutive SSRCs, cross-tile references, DONL in
   every payload. `tilesPerFrame=1` has no DONL (depacketizer must handle both), makes the host send only ~57.5 fps, and saves no
   decode CPU. Keep 4.
-- **Start:** the Mac's message 1 (ports) arrives in the drain right after the cipher starts, before iss offers. iss sends
-  **one** offer and reads until message 2 (the answer, ~0.05–0.2 s). The "degenerate answers" were iss reading only the
-  first chunk (layout/config rects); some answers really carry no canvas, but the stream starts anyway, so iss takes the
-  canvas from the layout's backing size. Re-sending (old behaviour, `ISS_OFFER_RESEND=1`) starts a new stream per offer.
-  The start burst stops once the socket backlog is drained, on a picture boundary (RTP marker): a continuous stream never
-  pauses 50 ms. With one offer: 1 SSRC group, 0–3 reference errors (old: 2–7 groups, ~33). SSRC adoption must still pick
-  the group that is **still sending** (#21). One "falling behind" resync just after the burst is still normal.
+- **Start:** like Apple's viewer, iss's first (plaintext) `SetEncodings` leaves out 1010 and the second (encrypted, sent
+  right after the cipher starts) names it; the Mac sends one message 1 per `SetEncodings` naming 1010, ~0.4–1.7 s later (its
+  own delay), and answers an offer only after it. iss waits for message 1, sends **one** offer and reads until message 2
+  (~0.05 s). Some answers carry no canvas; the canvas then comes from the layout's backing size. Re-sending (old behaviour,
+  `ISS_OFFER_RESEND=1`) starts a new stream per offer. The start burst stops once the socket backlog is drained, on a
+  picture boundary. The HW-decode probe runs in the background during the wait for message 1. Connect ≈ 3.2 s (was ~6.6;
+  `ISS_FAST_CONNECT=0` = old timing). SSRC adoption must still pick the group that is **still sending** (#21).
 - **Display changes:** every display change, including a wake from display sleep (same geometry), stops both legs; the
   Mac then sends a message 1 and restarts the stream only for a new offer. iss re-offers once per message 1 (0.3 s
   debounce), with a 1 s fallback on a geometry change that brings no message 1 (`ISS_REOFFER_ON_MSG1=0` = old trigger).
