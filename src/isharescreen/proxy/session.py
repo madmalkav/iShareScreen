@@ -454,6 +454,15 @@ class Session:
         # Per-display rects within the combined backing canvas (0x451 layout);
         # see the property `display_rects`. Also reset in `_teardown`.
         self._display_rects: list[DisplayRect] = []
+        # Return-to-virtual-display (see `_note_display_layout`).
+        self._current_display_id: Optional[int] = None
+        self._last_display_request_t = time.monotonic()
+        self._last_display_request: Optional[tuple[int, int, float]] = None
+        self._return_to_virtual_pending = False
+        self._last_return_t = 0.0
+        self._return_tries = 0
+        self._layout_flags: Optional[int] = None
+        self._awaiting_virtual = False
         self._needs_post_layout_fir: bool = False
         # Mid-session 0x1c re-offer, debounced: one offer per burst of the
         # Mac's message 1 / layout events (see `_request_reoffer`).
@@ -947,6 +956,8 @@ class Session:
         if neg is None:
             raise RuntimeError("Not connected")
         log.info("send_dynamic_resolution: requesting %dx%d", width, height)
+        self._last_display_request_t = time.monotonic()
+        self._last_display_request = (width, height, hidpi_scale)
         msg = build_virtual_display(
             width=width, height=height, hidpi_scale=hidpi_scale, hdr=False,
             refresh_hz=self._config.refresh_hz,
@@ -1836,6 +1847,15 @@ class Session:
         # Lets the frontend crop the one combined stream into per-monitor
         # windows for host↔client multi-monitor mapping.
         self._display_rects: list[DisplayRect] = []
+        # Return-to-virtual-display (see `_note_display_layout`).
+        self._current_display_id: Optional[int] = None
+        self._last_display_request_t = time.monotonic()
+        self._last_display_request: Optional[tuple[int, int, float]] = None
+        self._return_to_virtual_pending = False
+        self._last_return_t = 0.0
+        self._return_tries = 0
+        self._layout_flags: Optional[int] = None
+        self._awaiting_virtual = False
         self._needs_post_layout_fir = False
         self._needs_param_harvest = False
         self._harvest_vps = None
@@ -2122,6 +2142,104 @@ class Session:
 
         Session._libav_log_installed = True
         log.info("libav concealment-log handler installed (root handlers filter the noise)")
+
+    # Return to the virtual display. In curtain mode the host streams a
+    # virtual display it created for us; but on some console transitions
+    # (the user logging in or unlocking at the Mac, or the Mac waking) it
+    # silently switches the session to its PHYSICAL display (e.g. #1 at
+    # 5120x2160) — a size the viewer never asked for, which overloaded
+    # decoding. Re-sending our display request (what a window resize does
+    # manually) moves it back to a fresh virtual display.
+    _DISPLAY_REQUEST_GRACE_S: float = 10.0
+    _RETURN_TO_VIRTUAL_COOLDOWN_S: float = 15.0
+    _RETURN_TO_VIRTUAL_MAX_TRIES: int = 3
+
+    def _note_display_layout(self, rects: list[DisplayRect]) -> None:
+        """Called on every AppleDisplayLayout (RX thread): track which
+        display we're on and arm a return when the host switched displays
+        without us asking."""
+        cfg = self._config
+        if (not getattr(cfg, "curtain", True) or getattr(cfg, "alt_session", False)
+                or len(rects) != 1
+                or os.environ.get("ISS_RETURN_TO_VIRTUAL", "1") == "0"):
+            return
+        if self._layout_flags is not None:
+            return        # the layout's flags word says it directly (below)
+        did = rects[0].display_id
+        now = time.monotonic()
+        ours = now - self._last_display_request_t < self._DISPLAY_REQUEST_GRACE_S
+        if self._current_display_id is None or ours:
+            if ours and did != self._current_display_id:
+                self._return_tries = 0          # our request produced it
+            self._current_display_id = did
+            return
+        if did == self._current_display_id:
+            return
+        log.warning(
+            "host switched the session from display #%s to #%s without a "
+            "request (e.g. a login/unlock at the Mac); asking for the virtual "
+            "display again", self._current_display_id, did)
+        self._current_display_id = did
+        self._return_to_virtual_pending = True
+
+    def _note_layout_flags(self, flags: int) -> None:
+        """AppleDisplayLayout header flags (+0x0e, remotex protocol notes):
+        bit 0 the session is on a virtual display, bit 1 the viewer may switch
+        it, bit 2 on console, bit 3 the lock screen, bit 4 the login window
+        (High Performance: 0x5, 0x15 at the login window). A login at the Mac
+        moves the session to the new user's agent, which has only the physical
+        display: bit 0 clears and the stream stops, with no message 1. In
+        curtain mode ask for the virtual display again, and offer once it is
+        back (no message 1 comes for that either)."""
+        prev, self._layout_flags = self._layout_flags, flags
+        if prev is None or prev == flags:
+            return
+        log.info("AppleDisplayLayout flags 0x%x -> 0x%x", prev, flags)
+        cfg = self._config
+        if (not getattr(cfg, "curtain", True) or getattr(cfg, "alt_session", False)
+                or os.environ.get("ISS_RETURN_TO_VIRTUAL", "1") == "0"):
+            return
+        if prev & 1 and not flags & 1:
+            log.warning("the Mac moved the session to its physical display "
+                        "(e.g. a login at the Mac); asking for the virtual "
+                        "display again")
+            self._cancel_reoffer()     # no offer for a display we're leaving
+            self._return_to_virtual_pending = True
+            self._awaiting_virtual = True
+        elif flags & 1 and not prev & 1 and self._awaiting_virtual:
+            self._awaiting_virtual = False
+            self._request_reoffer(_REOFFER_SETTLE_S, "back on the virtual display")
+
+    def _cancel_reoffer(self) -> None:
+        with self._reoffer_lock:
+            t, self._reoffer_timer = self._reoffer_timer, None
+        if t is not None:
+            t.cancel()
+
+    def _maybe_return_to_virtual_display(self) -> None:
+        """TX loop: send the pending display request (rate-limited)."""
+        if not self._return_to_virtual_pending:
+            return
+        now = time.monotonic()
+        if now - self._last_return_t < self._RETURN_TO_VIRTUAL_COOLDOWN_S:
+            return
+        self._return_to_virtual_pending = False
+        if self._return_tries >= self._RETURN_TO_VIRTUAL_MAX_TRIES:
+            log.warning("not asking for the virtual display again: %d "
+                        "attempts didn't stick", self._return_tries)
+            return
+        req = self._last_display_request
+        if req is None and self._config.advertise is not None:
+            adv = self._config.advertise
+            req = (adv.width, adv.height, adv.hidpi_scale)
+        if req is None:
+            return
+        self._last_return_t = now
+        self._return_tries += 1
+        try:
+            self.send_dynamic_resolution(*req)
+        except Exception as e:
+            log.warning("return to virtual display failed: %s", e)
 
     def _on_libav_hwaccel_failure(self, msg: str) -> None:
         """Keep PyAV's successful software fallback, but stop HW retries."""
@@ -3438,12 +3556,12 @@ class Session:
         #   [2..3] u16 BE   = body length (= 4 for the heartbeat shape)
         #   [4..5] u16 BE   = client/flags (observed = 1)
         #   [6..7] u16 BE   = cmd          (THIS is the dispatch byte)
-        # cmd values observed:
-        #   12 = MiscStatus heartbeat (every 2.1 s) — fires when the
-        #        viewer's command-mask grants the bit
+        # cmd values (remotex protocol notes, "Other messages"):
+        #   4  = heartbeat (re-pushed every couple of seconds)
         #   2  = remote clipboard changed (autopasteboard generation
         #        bumped) — viewer responds with msg 0x0b fetch
-        #   11 = UserSessionChanged
+        #   11, 12 = the pointer is hidden / shown again
+        #   17 = the Mac's user session changed: a login or a logout
         if msg_type == 0x14:
             cmd = struct.unpack(">H", msg[6:8])[0] if len(msg) >= 8 else None
             # Only log on change — the host re-pushes the same status
@@ -3451,6 +3569,9 @@ class Session:
             if cmd != self._last_misc_status_cmd:
                 log.debug("server sent 0x14 misc-status (cmd=%s): %s", cmd, msg.hex())
                 self._last_misc_status_cmd = cmd
+            if cmd == 17:
+                log.info("the Mac's user session changed (a login or logout at "
+                         "the Mac)")
             if cmd == 2:
                 log.info("remote clipboard changed; sending fetch (0x0b)")
                 try:
@@ -3607,6 +3728,7 @@ class Session:
                 )
                 if layout is not None:
                     _bw, _bh, rects = layout
+                    self._note_display_layout(rects)
                     if rects != self._display_rects:
                         self._display_rects = rects
                         log.info(
@@ -3727,6 +3849,10 @@ class Session:
                                               keep_pending=True)
                     else:
                         self._schedule_post_layout_arm()
+                # Header flags (+0x0e): which kind of display the session is on.
+                if prefix_len >= 0x12:
+                    self._note_layout_flags(struct.unpack(
+                        ">I", msg[offset + 2 + 0x0e:offset + 2 + 0x12])[0])
                 offset += 2 + prefix_len
             else:
                 # A non-cursor, non-config rect on the control channel means
@@ -4072,6 +4198,7 @@ class Session:
                 # NACK first: a promptly repaired packet avoids the FIR/context
                 # recovery path entirely.
                 self._drain_pending_nack()
+                self._maybe_return_to_virtual_display()
                 self._drain_pending_fir()
                 self._maybe_reanchor_d3d11va_avc()
                 self._check_stall()
