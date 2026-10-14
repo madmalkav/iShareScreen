@@ -50,6 +50,7 @@ _nalu_dump_f = open(_NALU_DUMP_PATH, "wb") if _NALU_DUMP_PATH else None
 _DECODE_DELAY_S = float(os.environ.get("ISS_DECODE_DELAY_MS", "0") or 0) / 1000.0
 
 import av
+from collections import deque
 
 from .tiles import TileFrame
 from .nalu import IDR_RANGE
@@ -329,6 +330,12 @@ class HevcDecoder:
         self._pts_to_tile: dict[int, int] = {}
         self._pts_submit_t: dict[int, float] = {}
         self._decode_latency_ms: float = 0.0
+        # ISS_LAT_TRACE: per-tile FIFO of (first_arrival, last_arrival, fed)
+        # pushed by the session per picture; matched to the slice at decode
+        # time and completed at output (see `lat_last_out`).
+        self._lat_fifo: dict[int, deque] = {}
+        self._lat_by_pts: dict[int, tuple] = {}
+        self.lat_last_out: dict[int, tuple] = {}
         self._eagain_streak = 0
         # Session-wide IDR seen since last decoder reset. Cross-tile DPB
         # references mean every tile's frames become visually meaningful
@@ -784,6 +791,13 @@ class HevcDecoder:
         self._pts_to_tile[pts] = tile_idx
         import time as _time
         self._pts_submit_t[pts] = _time.monotonic()
+        _lf = getattr(self, "_lat_fifo", None)
+        if _lf and nalu and (nalu[0] >> 1) & 0x3F < 32:     # a slice
+            fifo = _lf.get(tile_idx)
+            if fifo:
+                self._lat_by_pts[pts] = fifo.popleft() + (self._pts_submit_t[pts],)
+                if len(self._lat_by_pts) > 256:
+                    self._lat_by_pts.pop(next(iter(self._lat_by_pts)))
         self._next_pts += 1
         if len(self._pts_to_tile) > _PTS_MAP_SOFT_MAX:
             cutoff = pts - _PTS_MAP_PRUNE_KEEP
@@ -870,6 +884,11 @@ class HevcDecoder:
             import time as _time
             latency_ms = (_time.monotonic() - submit_t) * 1000
             self._decode_latency_ms = 0.1 * latency_ms + 0.9 * self._decode_latency_ms
+        if getattr(self, "_lat_by_pts", None):
+            tr = self._lat_by_pts.pop(frame.pts, None)
+            if tr is not None:
+                import time as _time
+                self.lat_last_out[ti] = tr + (_time.monotonic(),)
 
         # Concealed (gray) frames carry libav's decode-error flag; count
         # them in good_count (throughput) but NOT clean_count (real video),

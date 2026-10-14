@@ -260,6 +260,9 @@ def _disable_udp_connreset(sock: socket.socket) -> None:
         log.debug("SIO_UDP_CONNRESET not disabled: %s", e)
 
 
+# ISS_LAT_TRACE=1: log per-stage picture latency every 5 s (diagnostic).
+_LAT_TRACE = os.environ.get("ISS_LAT_TRACE") == "1"
+
 # Re-offer timing (seconds) after the Mac's message 1, and the fallback after
 # a geometry change that brings no message 1.
 _REOFFER_SETTLE_S = 0.3
@@ -625,6 +628,10 @@ class Session:
         )
         self._ltr_last_acked: int = 0
         self._ltr_acks_sent: int = 0
+        self._lat_arrival: dict[int, float] = {}
+        self._lat_grp: dict[tuple[int, int], list[float]] = {}
+        self._lat_samples: list[tuple] = []
+        self._lat_last_log = 0.0
         # The per-ack LTR log fires at frame rate and drowns the debug log
         # (a `tail` then only covers a few seconds, hiding real events like
         # gray-outs). Off by default; ISS_LOG_LTR=1 re-enables it for LTRP
@@ -781,6 +788,8 @@ class Session:
                 f"tile_idx {tile_idx} out of range [0, {self.num_tiles})"
             )
         tf = self._decoder.get_frame(tile_idx)
+        if tf is not None and _LAT_TRACE:
+            self._lat_note_consumed(tile_idx)
         if tf is not None:
             if len(self._shown_counts) != self.num_tiles:
                 self._shown_counts = [0] * self.num_tiles
@@ -2481,6 +2490,10 @@ class Session:
                     if phase < 0.020:  # ~20 ms ≈ one frame at 60 fps
                         loss_count += 1
                         continue
+            if _LAT_TRACE:
+                self._lat_arrival[id(pkt)] = time.monotonic()
+                if len(self._lat_arrival) > 20000:
+                    self._lat_arrival.clear()
             try:
                 q.put_nowait(pkt)
             except queue.Full:
@@ -2509,6 +2522,16 @@ class Session:
             seq = struct.unpack(">H", hdr[2:4])[0]
             ts = struct.unpack(">I", hdr[4:8])[0]
             marker = bool(hdr[1] & 0x80)
+            if _LAT_TRACE:
+                t_arr = self._lat_arrival.pop(id(pkt), None)
+                if t_arr is not None:
+                    g = self._lat_grp.get((ssrc, ts))
+                    if g is None:
+                        self._lat_grp[(ssrc, ts)] = [t_arr, t_arr]
+                        if len(self._lat_grp) > 512:
+                            self._lat_grp.pop(next(iter(self._lat_grp)))
+                    else:
+                        g[1] = max(g[1], t_arr)
 
             self._track_seq(ssrc, seq)
             self._ssrc_last_seen[ssrc] = time.monotonic()
@@ -2804,8 +2827,44 @@ class Session:
                 for nalu in nalus:
                     self._decoder.feed_nalu(nalu, ti, donl=donl)
         else:
+            if _LAT_TRACE:
+                self._lat_push(key, ti)
             for nalu in nalus:
                 self._decoder.feed_nalu(nalu, ti, donl=donl)
+
+    def _lat_push(self, key: tuple[int, int], ti: Optional[int]) -> None:
+        """ISS_LAT_TRACE: hand the picture's arrival times to the decoder."""
+        g = self._lat_grp.pop(key, None)
+        fifo_map = getattr(self._decoder, "_lat_fifo", None)
+        if g is None or ti is None or fifo_map is None:
+            return
+        fifo = fifo_map.setdefault(ti, deque(maxlen=64))
+        fifo.append((g[0], g[1], time.monotonic()))
+
+    def _lat_note_consumed(self, ti: int) -> None:
+        """ISS_LAT_TRACE: the frontend took tile `ti`'s frame: one sample.
+        Stages: arrive = first to last packet of the picture; assemble =
+        last packet to handed to the decoder; queue = waiting for the decode
+        worker; decode = libav; handoff = decoded to taken by the frontend."""
+        out = getattr(self._decoder, "lat_last_out", None)
+        tr = out.pop(ti, None) if out else None
+        if tr is None:
+            return
+        first, last, fed, submit, done = tr
+        now = time.monotonic()
+        self._lat_samples.append((last - first, fed - last, submit - fed, done - submit,
+                                  now - done, now - first))
+        if now - self._lat_last_log >= 5.0 and len(self._lat_samples) >= 20:
+            self._lat_last_log = now
+            cols = list(zip(*self._lat_samples))
+            self._lat_samples.clear()
+
+            def pct(v, p):
+                v = sorted(v)
+                return v[min(len(v) - 1, int(p * len(v)))] * 1000
+            names = ("arrive", "assemble", "queue", "decode", "handoff", "total")
+            log.info("latency ms (p50/p95, %d pictures): %s", len(cols[0]), "  ".join(
+                f"{n}={pct(c, .5):.1f}/{pct(c, .95):.1f}" for n, c in zip(names, cols)))
 
     def _maybe_reharvest_avc_config(self, payloads: list[bytes]) -> None:
         """AVC post-resize reconfigure. Apple re-sends the 0x92 avcC config
