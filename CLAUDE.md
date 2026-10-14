@@ -134,7 +134,7 @@ decoder).
 2. **Host switching to its physical display** on a local login during a curtain session: #37 re-requests the virtual
    display when the layout header flags (+0x0e) lose bit 0 (virtual), per [REMOTEX] rfc §8.4; flags 0x5 in curtain mode
    verified on the M4. Still needs a live check with a real local login at the Mac. (Branches `fix/return-to-virtual-display`
-   and `fix/hide-startup-gray` are superseded / not needed; delete them.)
+   and `fix/hide-startup-gray` were superseded / not needed and are deleted.)
 3. **Software decode cost after RCTL:** at ~56 Mbit/s, 4K60 HEVC software decode needs ~6 cores. Weak CPUs rely on the
    delay feedback to make the host back off; not measured on a weak machine.
 4. **RCTL's second byte:** meaning unknown, sent as 0 (accepted). The loss bits and BWE add nothing (see facts above).
