@@ -73,6 +73,15 @@ _MAX_ADVERTISE_W = 1920  # server backing 3840 / mode-table ratio 2
 _MAX_ADVERTISE_H = 1080
 
 
+def _take_wheel_ticks(accum: list) -> int:
+    """Whole wheel ticks to send now from a [float] accumulator: cap the
+    pending magnitude at 200, emit at most 50 and carry the rest."""
+    accum[0] = max(-200.0, min(200.0, accum[0]))
+    emit = max(-50, min(50, int(accum[0])))
+    accum[0] -= emit
+    return emit
+
+
 def _even(n: int) -> int:
     """Round down to an even number. HEVC tile geometry prefers even
     dimensions; odd sizes can confuse the encoder's CTU padding."""
@@ -625,10 +634,11 @@ def run(
     # RFB scroll feels glacial vs the OS-native scroll the user is
     # used to.
     _wheel_accum = [0.0]
+    _wheel_accum_x = [0.0]
     _wheel_last_t = [0.0]
 
-    def on_scroll(_w, _x, dy):
-        if cursor is None or dy == 0:
+    def on_scroll(_w, dx, dy):
+        if cursor is None or (dy == 0 and dx == 0):
             return
         now = time.monotonic() * 1000.0  # ms
         dt = now - _wheel_last_t[0]
@@ -646,17 +656,18 @@ def run(
         # it, or sub-tick motion from a high-res wheel is thrown away and the
         # scroll can never build past 1 tick. `scroll_event` reads dy<0 as up.
         _wheel_accum[0] += -dy * _WHEEL_MULT * accel
+        # Horizontal (tilt wheel / trackpad): only the precise 0x17 path
+        # carries it; GLFW's positive x offset is left, so flip it like y.
+        _wheel_accum_x[0] += -dx * _WHEEL_MULT * accel
         # Cap the pending magnitude so a single violent flick doesn't leave a
         # long tail of catch-up events, then emit at most 50 ticks this event
         # and CARRY the rest (including any clamp overflow) — subtracting only
         # what we emit, so fast scrolls aren't silently truncated.
-        _wheel_accum[0] = max(-200.0, min(200.0, _wheel_accum[0]))
-        ticks = int(_wheel_accum[0])      # whole ticks pending (toward zero)
-        if ticks == 0:
+        emit = _take_wheel_ticks(_wheel_accum)
+        emit_x = _take_wheel_ticks(_wheel_accum_x)
+        if emit == 0 and emit_x == 0:
             return                        # sub-tick: keep the fraction, let it build
-        emit = max(-50, min(50, ticks))
-        _wheel_accum[0] -= emit           # carry remainder + clamp overflow
-        session.input.scroll_event(cursor[0], cursor[1], 0, emit)
+        session.input.scroll_event(cursor[0], cursor[1], emit_x, emit)
 
     # Ctrl→Cmd remap: rewrite local Ctrl into the Mac's Cmd modifier
     # so Ctrl+C / Ctrl+V "feel right". Off by default now — the OS
@@ -782,7 +793,7 @@ def run(
         ctx2.configure(device=device, format=surface_format, alpha_mode="opaque")
         st = _types.SimpleNamespace(
             window=w2, glfw_window=gw2, crop=crop, cursor=None, last_drawn=None,
-            button_mask=0, in_win={"v": True}, wheel_accum=[0.0], wheel_last=[0.0],
+            button_mask=0, in_win={"v": True}, wheel_accum=[0.0], wheel_accum_x=[0.0], wheel_last=[0.0],
             device_lost=False,
         )
 
@@ -823,8 +834,8 @@ def run(
             if st.cursor is not None:
                 session.input.pointer_event(st.button_mask, st.cursor[0], st.cursor[1])
 
-        def on_scroll2(_w, _x, dy):
-            if st.cursor is None or dy == 0:
+        def on_scroll2(_w, dx, dy):
+            if st.cursor is None or (dy == 0 and dx == 0):
                 return
             now = time.monotonic() * 1000.0
             dt = now - st.wheel_last[0]
@@ -832,13 +843,12 @@ def run(
             accel = (10.0 if dt < 25 else 6.0 if dt < 50 else 3.5 if dt < 100
                      else 2.0 if dt < 200 else 1.4 if dt < 350 else 1.0)
             st.wheel_accum[0] += -dy * _WHEEL_MULT * accel
-            st.wheel_accum[0] = max(-200.0, min(200.0, st.wheel_accum[0]))
-            ticks = int(st.wheel_accum[0])
-            if ticks == 0:
+            st.wheel_accum_x[0] += -dx * _WHEEL_MULT * accel
+            emit = _take_wheel_ticks(st.wheel_accum)
+            emit_x = _take_wheel_ticks(st.wheel_accum_x)
+            if emit == 0 and emit_x == 0:
                 return
-            emit = max(-50, min(50, ticks))
-            st.wheel_accum[0] -= emit
-            session.input.scroll_event(st.cursor[0], st.cursor[1], 0, emit)
+            session.input.scroll_event(st.cursor[0], st.cursor[1], emit_x, emit)
 
         def on_enter2(_w, entered):
             st.in_win["v"] = bool(entered)

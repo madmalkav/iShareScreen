@@ -136,7 +136,7 @@ decoder).
 5. **ProRes:** revisit only if a way to request it becomes known (see above).
 6. **From the remotex notes (rfc §8.11, §10.3, §10.7, §10.8), not built yet:**
    - 1-tile (H.264) streams: LTR acks (payload = RTP timestamp) + PSFB FMT 2 refresh requests instead of IDRs. 4 tiles have no LTR.
-   - Scroll message `0x17` (precise, both axes); two virtual displays.
+   - Two virtual displays.
 7. **Free-threaded Python 3.14t:** iss runs headless on it with the GIL off (every dependency has a 3.14t wheel except
    `aioquic`, so no browser frontend). On the RTX 2080 box it saved ~4 % CPU and gained no fps: iss's Python threads total
    ~45–60 % of a core (CUDA or software decode), so the GIL isn't a bottleneck there. Measure on a slow CPU before supporting it.
