@@ -854,10 +854,12 @@ The captured native client's feedback differs from an alternative client's; both
 Media RTCP is rtcp-muxed onto each media port (§10.4). Observed native-client feedback:
 
 - Receiver Reports (PT 201) and SDES (PT 202) from the client; Sender Reports (PT 200) from the server;
-- a keyframe request as **PT 192**. This is AVConference's own FIR form, **not** RFC 2032's: the sender's SSRC followed by a list of 16-bit values; a variant naming the picture size brings a small IDR ([REMOTEX]). AVConference also accepts RFC 5104's FIR (PT 206, FMT 4), chosen by a per-stream setting;
+- a keyframe request as **PT 192**. This is AVConference's own FIR form, **not** RFC 2032's: the sender's SSRC followed by a list of 16-bit values; a variant naming the picture size brings a small IDR ([REMOTEX]). AVConference also accepts RFC 5104's FIR (PT 206, FMT 4), chosen by a per-stream setting. *(Verified by an interoperable client on a macOS 27.2 host: a PT 192 packet carrying only the target SSRC — the RFC 2032 form — brings an IDR as reliably and as quickly as an RFC 5104 FIR or a PLI, 9–28 ms, with the same IDR size; several requests in one compound packet bring one IDR, the rest logged `Request key frame too soon, discard`.)*;
 - an application-defined packet (PT 204) whose name is the number `5`: the LTR acknowledgment below.
 
 > A different interoperable client uses AVPF feedback instead: FIR (PT 206, FMT 4), PLI (PT 206, FMT 1), generic NACK (PT 205, FMT 1), an empty SR (PT 200), and an APP packet for long-term-reference acknowledgment. Servers accept both feedback styles. The LTR acknowledgment's payload and the refresh request are described below for 1-tile streams; what Apple's viewer acknowledges for a 4-tile stream remains a **revision gap**.
+
+**Retransmission is off.** The host configures the video stream with `vcMediaStreamIsRTXEnabled = 0` and never answers a generic NACK; a lost packet is repaired only by a keyframe (or, on a 1-tile stream, a refresh picture). Measured with simulated downlink loss: 5 % random loss halved the pictures shown; the controller's `Uplink PLR` tracked the loss (from the `RCTL` packet count) but its target did not move.
 
 A client without a live feedback loop (e.g. replaying a capture) cannot recover from a lost reference picture; a live client relies on FIR/NACK/LTR to keep the shared decoder synchronized. A PLI or FIR brings an IDR within about 30 ms ([REMOTEX]). The host accepts compound packets that start with PT 192, 193, 204, 205 or 206.
 
