@@ -262,6 +262,10 @@ class SessionConfig:
     # Cap on the host's video bitrate (kbit/s) via the offer's bitrate tiers;
     # None = Apple's tiers (the host adapts between 20 and 60 Mbit/s).
     max_bitrate_kbps: Optional[int] = None
+    # Refresh rate of the host's virtual display (curtain mode). The Mac
+    # sends at most one picture per refresh and encodes at most 60/s, so 30
+    # halves the pictures and the viewer's decode work.
+    refresh_hz: int = 60
     # HiDPI mode for the host's virtual display, resolved to a backing:point
     # ratio by the frontend (which knows the window size):
     #   "on"   → always 2× (Retina): crisp, but ~4× the pixels = more
@@ -879,6 +883,7 @@ class Session:
         log.info("send_dynamic_resolution: requesting %dx%d", width, height)
         msg = build_virtual_display(
             width=width, height=height, hidpi_scale=hidpi_scale, hdr=False,
+            refresh_hz=self._config.refresh_hz,
         )
         neg.cipher.encrypt_and_send(neg.sock, msg)
         # Re-arm the TCP side with a 1x1 incremental request (as the regular
@@ -1496,6 +1501,7 @@ class Session:
             advertise=cfg.advertise,
             hdr=cfg.hdr,
             curtain=cfg.curtain,
+            refresh_hz=cfg.refresh_hz,
             audio_offer=audio_offer,
             video_offer=video_offer,
             share_console=cfg.share_console,

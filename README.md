@@ -203,7 +203,10 @@ an API with `--hwaccel`, to keep hardware.
 ### Troubleshooting
 
 - **Choppy picture or gray patches:** the decoder can't keep up. Try
-  `--codec avc`, a smaller `--advertise`, or a different `--hwaccel`.
+  `--refresh-rate 30`, `--codec avc`, a smaller `--advertise`, or a different
+  `--hwaccel`. `--refresh-rate 30` halves the pictures the Mac sends (each one
+  keeps its quality): software HEVC 4:4:4 decoding at 4K went from 319 % to
+  183 % of a CPU core, so a weaker machine can keep HEVC's sharper colour.
 - **The picture falls further and further behind (slow network or slow
   decoder):** cap the Mac's video bitrate with `--max-bitrate` (Mbit/s), e.g.
   `--max-bitrate 8`. Without a cap the Mac uses 20–60 Mbit/s; a cap lowers that

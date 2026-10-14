@@ -214,6 +214,16 @@ def _make_parser() -> argparse.ArgumentParser:
         ),
     )
     g.add_argument(
+        "--refresh-rate", type=int, choices=[60, 30], default=60, metavar="HZ",
+        help=(
+            "refresh rate of the Mac's virtual display: 60 (default) or 30. "
+            "The Mac sends at most one picture per refresh, so 30 halves the "
+            "pictures and the decode work (each picture keeps its quality), "
+            "for a slow decoder or link. Applies to curtain mode (the "
+            "virtual display); ignored with --no-curtain"
+        ),
+    )
+    g.add_argument(
         "--cursor", choices=["overlay", "video"], default="overlay",
         help=(
             "how the Mac's pointer is shown. 'overlay' (default): the host "
@@ -456,6 +466,7 @@ def _build_session_config(args: argparse.Namespace) -> SessionConfig:
         curtain=args.curtain,
         audio=args.audio,
         max_bitrate_kbps=_max_bitrate_kbps(args.max_bitrate),
+        refresh_hz=args.refresh_rate,
         share_console=args.share_console, alt_session=args.alt_session,
         on_session_choice=_ask_session_choice if os.environ.get("ISS_SESSION_CHOICE_URL") else None,
         control_socket=args.control_socket,

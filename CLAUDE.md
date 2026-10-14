@@ -74,7 +74,8 @@ guide is the README's "Codecs and decoders" section.
 - **Liveness:** no video + no host RTCP for 10 s → warning; 48 s → session ends (Apple's limit). Armed only after host RTCP has
   been seen (#25).
 - **Refresh:** the host accepts any virtual-display refresh in the `0x1d` mode (30/60/90/120), but its **encoder frame rate stays
-  60** (`vcMediaStreamFramerate = 60`). 30 Hz halves the pictures and decode cost; >60 gives nothing.
+  60** (`vcMediaStreamFramerate = 60`). 30 Hz halves the pictures and decode cost (`--refresh-rate 30`: software
+  HEVC 4K 319 % → 183 % of a core; kept across resizes); >60 gives nothing.
 - **`AutoFrameBufferUpdate` (`0x09`):** its `u32` is a push interval in µs, `0xffffffff` = pushes off ([REMOTEX], rfc §8.11).
   iss arms nothing and polls 1×1 incremental every tx tick, which keeps cursor shapes flowing.
 - **Curtain mode** (default) gives the virtual display at the requested size and locks the host's local screen while the session
@@ -119,20 +120,17 @@ decoder).
    `defaults write com.apple.VideoConference forceVideoStreamFramerate|forceEncodeFramerate` (undo:
    `defaults delete com.apple.VideoConference`); then look for a viewer-side offer field. At the 60 Mbit/s cap, 120 fps halves
    the bits per picture.
-2. **`--refresh-rate 60|30` option:** a proven decode-cost lever (−44 % software CPU, same per-picture quality); not built.
-   Could let weak/Intel viewers keep HEVC 4:4:4 at 30 fps instead of H.264.
-3. **Host switching to its physical display** (on local login or long idle) during a curtain session. Branch
+2. **Host switching to its physical display** (on local login or long idle) during a curtain session. Branch
    `fix/return-to-virtual-display` (pushed, not merged) re-requests the virtual display after an unrequested switch; it needs
    live confirmation (a local login or long idle during a session) before merging. Branch `fix/hide-startup-gray` (pushed,
    not merged) holds tiles at decoder start until a keyframe; since #21 startups are mostly clean, so check whether it's still
    needed. The layout's session-state word ([REMOTEX] reading, rfc §8.4) may be a better trigger than inferring the switch.
-4. **Software decode cost after RCTL:** at ~56 Mbit/s, 4K60 HEVC software decode needs ~6 cores. Weak CPUs rely on the
+3. **Software decode cost after RCTL:** at ~56 Mbit/s, 4K60 HEVC software decode needs ~6 cores. Weak CPUs rely on the
    delay feedback to make the host back off; not measured on a weak machine.
-5. **Host rate-control inputs not sent:** RCTL's second byte (meaning unknown) and loss/BWE fields are sent as 0/60000.
+4. **Host rate-control inputs not sent:** RCTL's second byte (meaning unknown) and loss/BWE fields are sent as 0/60000.
    Loss reporting might matter on lossy links; untested.
-6. **ProRes:** revisit only if a way to request it becomes known (see above).
-7. **From the remotex notes (rfc §8.11, §10.3, §10.7, §10.8), not built yet:**
-   - `--max-bitrate`: offer tiers ≤ N to cap the encoder for slow viewers (better than the backlog guard, PR #27).
+5. **ProRes:** revisit only if a way to request it becomes known (see above).
+6. **From the remotex notes (rfc §8.11, §10.3, §10.7, §10.8), not built yet:**
    - Offer once per host message 1: done in PR #30 (one offer at connect, re-offer per message 1, display-wake fix).
    - Keyframe requests: the host drops one within 1 s (1 tile) / 10 ms (4 tiles) of its last keyframe; re-request until a
      usable picture arrives.
