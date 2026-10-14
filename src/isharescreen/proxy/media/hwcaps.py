@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import threading
 
 log = logging.getLogger(__name__)
 
@@ -117,6 +118,9 @@ def _probe_one(hwaccel_type: str) -> bool:
 
 
 _method_cache: dict[str, str] = {}
+# The probe may be warmed up from a background thread while the session
+# connects (see Session); the lock keeps it to one probe at a time.
+_method_lock = threading.Lock()
 
 
 def _qsv_hevc444() -> bool:
@@ -154,6 +158,11 @@ def hevc444_decode_method() -> "str | None":
     """How HEVC 4:4:4 can be hardware-decoded here: ``"qsv"`` (Intel Quick
     Sync), ``"libav"`` (generic libav hwaccel / native VideoToolbox), or
     ``None`` (no HW 4:4:4 → AVC fallback). Cached for the process lifetime."""
+    with _method_lock:
+        return _hevc444_decode_method_locked()
+
+
+def _hevc444_decode_method_locked() -> "str | None":
     if "method" in _method_cache:
         return _method_cache["method"] or None
     override = os.environ.get("ISS_HEVC444")
