@@ -35,6 +35,7 @@ from .decode_common import (
     _CODEC_FLAG_LOW_DELAY, _CODEC_FLAG2_FAST,
     _NAL_START_CODE, _TileSlot, _av_frame_to_tile, chroma_trace,
 )
+from . import libav_log as _libav_log
 from .tiles import TileFrame
 from .quality_gate import FrameQualityGate
 
@@ -492,7 +493,10 @@ class AvcDecoder:
                 }
             try:
                 _t_dec = _time.perf_counter()
-                frames = ctx.decode(pkt)
+                # libav's log lines from this call are handled as it returns,
+                # before its frames are published (see the loop below).
+                with _libav_log.decoding():
+                    frames = ctx.decode(pkt)
                 self._account_decode_load(_time.perf_counter() - _t_dec)
             except Exception:
                 # Decode raised → no frame will carry this pts; drop it so the
@@ -511,8 +515,8 @@ class AvcDecoder:
             for frame in frames:
                 ti = self._pts_to_tile.pop(frame.pts, tile_idx)
                 submit_t = self._pts_submit_t.pop(frame.pts, None)
-                # The libav callback can arm recovery synchronously from inside
-                # ctx.decode(pkt). Never publish that same concealed frame:
+                # The libav log handler can arm recovery synchronously as
+                # ctx.decode(pkt) returns. Never publish that same concealed frame:
                 # hold the last known-good picture while deltas are gated and
                 # the requested intra recovery frame is in flight.
                 if self._reference_reset_pending:
@@ -704,11 +708,12 @@ class AvcDecoder:
         return [t.clean_count for t in self._tiles]
 
     def mark_reference_chain_broken(self, trigger: str = "") -> None:
-        """Arm loss recovery without touching libav from its log callback.
+        """Arm loss recovery without touching libav from its log handler.
 
-        This method is intentionally lock-free: PyAV invokes the session's
-        concealment handler synchronously while ``ctx.decode()`` holds
-        ``_codec_lock``, so closing the codec here would deadlock. The next
+        This method is intentionally lock-free: the session's concealment
+        handler runs synchronously right after ``ctx.decode()``, still under
+        ``_codec_lock`` (see ``libav_log.decoding``), so closing the codec here
+        would deadlock. The next
         ``feed_nalu`` drops deltas until a complete intra frame arrives, then
         performs the actual context rebuild under the normal decode lock.
         """

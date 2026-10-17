@@ -2050,8 +2050,6 @@ class Session:
             log.debug("av.logging not available; no decoder-error hook")
             Session._libav_log_installed = True
             return
-        # Raise PyAV's libav verbosity so concealment WARNINGs reach
-        # the Python logger.
         # Surface EVERY libav message reaching the handler (before the
         # keyword whitelist below drops it), so a HW decoder's own error
         # reports aren't silently discarded — this is how we find out what
@@ -2060,11 +2058,6 @@ class Session:
         # that matter (decode / hwaccel errors) are ERROR-class, so it stays
         # quiet during normal playback and only fires on real trouble.
         _log_all_libav = os.environ.get("ISS_LOG_LIBAV", "1") != "0"
-        try:
-            _avlog.set_libav_level(_avlog.WARNING)
-            _avlog.set_level(_avlog.WARNING)
-        except Exception:
-            pass
 
         concealment_keywords = (
             "could not find ref",
@@ -2083,32 +2076,56 @@ class Session:
             "hwaccel initialisation returned error",
         )
 
+        def _dispatch(source: str, raw: str) -> None:
+            msg = raw.lower()
+            is_hwaccel_failure = any(kw in msg for kw in hwaccel_failure_keywords)
+            if _log_all_libav and not is_hwaccel_failure:
+                # Diagnostic: log it ALL, before the whitelist drops it.
+                log.info("LIBAV_RAW[%s] %s", source, raw)
+            if is_hwaccel_failure:
+                for sess in tuple(getattr(Session, "_active_sessions", ())):
+                    try:
+                        sess._on_libav_hwaccel_failure(raw)
+                    except Exception:
+                        pass
+            if not any(kw in msg for kw in concealment_keywords):
+                return
+            for sess in tuple(getattr(Session, "_active_sessions", ())):
+                try:
+                    sess._on_libav_concealment(raw)
+                except Exception:
+                    pass
+
+        # libav must never run Python inside av_log: it can log while holding
+        # one of its own locks (a hardware frame pool's mutex), and the main
+        # thread can hold the GIL while waiting for that lock (dropping a
+        # frame) — a process-wide freeze. So libav keeps its C logger and its
+        # lines are read from a pipe right after each decode() (see
+        # media/libav_log.py), on the decoding thread as before.
+        from .media import libav_log
+        if libav_log.install(_dispatch, _avlog.WARNING):
+            import atexit
+            atexit.register(libav_log.uninstall)
+            Session._libav_log_installed = True
+            log.info("libav log: read from libav's own logger (no Python "
+                     "callback inside av_log)")
+            return
+
+        # Not Linux/glibc: PyAV's Python callback, as before. It takes the GIL
+        # inside av_log, so the freeze above remains possible here.
+        try:
+            _avlog.set_libav_level(_avlog.WARNING)
+            _avlog.set_level(_avlog.WARNING)
+        except Exception:
+            pass
+
         class _LibavConcealmentHandler(logging.Handler):
             def emit(self_h, record):  # noqa: N805
                 try:
                     raw = record.getMessage().strip()
                 except Exception:
                     return
-                msg = raw.lower()
-                is_hwaccel_failure = any(
-                    kw in msg for kw in hwaccel_failure_keywords
-                )
-                if _log_all_libav and not is_hwaccel_failure:
-                    # Diagnostic: log it ALL, before the whitelist drops it.
-                    log.info("LIBAV_RAW[%s] %s", record.levelname, raw)
-                if is_hwaccel_failure:
-                    for sess in tuple(getattr(Session, "_active_sessions", ())):
-                        try:
-                            sess._on_libav_hwaccel_failure(raw)
-                        except Exception:
-                            pass
-                if not any(kw in msg for kw in concealment_keywords):
-                    return
-                for sess in tuple(getattr(Session, "_active_sessions", ())):
-                    try:
-                        sess._on_libav_concealment(record.getMessage().strip())
-                    except Exception:
-                        pass
+                _dispatch(record.levelname, raw)
 
         handler = _LibavConcealmentHandler(level=logging.WARNING)
         logging.getLogger("libav").addHandler(handler)

@@ -52,6 +52,7 @@ _DECODE_DELAY_S = float(os.environ.get("ISS_DECODE_DELAY_MS", "0") or 0) / 1000.
 import av
 from collections import deque
 
+from . import libav_log as _libav_log
 from .tiles import TileFrame
 from .nalu import IDR_RANGE
 from .quality_gate import FrameQualityGate, TileVisState
@@ -811,7 +812,9 @@ class HevcDecoder:
                 # got the lock.
                 if self._codec is None:
                     return
-                frames = self._codec.decode(pkt)
+                # libav's log lines from this call are handled as it returns.
+                with _libav_log.decoding():
+                    frames = self._codec.decode(pkt)
             published = False
             for frame in frames:
                 self._publish_frame(frame)
