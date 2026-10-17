@@ -131,6 +131,7 @@ def _av_frame_to_tile(
     *,
     copy: bool = False,
     rtp_ts: Optional[int] = None,
+    download=None,
 ) -> tuple[Optional[TileFrame], bool]:
     """Convert an `av.VideoFrame` to our `TileFrame`.
 
@@ -143,7 +144,9 @@ def _av_frame_to_tile(
 
     Planes are zero-copy views unless `copy=True` (see below); QSV passes
     `copy=True` so its surfaces are never touched outside its codec lock.
-    `rtp_ts` is passed through to the tile (see `TileFrame.rtp_ts`)."""
+    `rtp_ts` is passed through to the tile (see `TileFrame.rtp_ts`).
+    `download(frame)` may download a GPU frame itself, returning (y, u, v,
+    stride) of a 4:4:4 picture, or None to use PyAV's download."""
     err = getattr(frame, "decode_error_flags", 0)
     flg = getattr(frame, "flags", 0)
     had_error = bool(err) or bool(flg & 0x01)
@@ -155,6 +158,16 @@ def _av_frame_to_tile(
     if fmt not in seen_fmts:
         seen_fmts.add(fmt)
         log.info("decoded frame format: %s (%dx%d)", fmt, width, height)
+
+    if fmt in _HW_FRAME_FORMATS and download is not None:
+        planes = download(frame)
+        if planes is not None:
+            y, u, v, stride = planes
+            return TileFrame(
+                y=y, u=u, v=v, width=width, height=height,
+                y_stride=stride, uv_stride=stride,
+                chroma_width=width, chroma_height=height, rtp_ts=rtp_ts,
+            ), had_error
 
     if fmt in _HW_FRAME_FORMATS:
         if reformatter_holder[0] is None:
