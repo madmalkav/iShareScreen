@@ -77,10 +77,10 @@ def test_resync_has_a_cooldown():
 def test_worker_discards_backlog_then_keeps_decoding(monkeypatch):
     d = _decoder()
     decoded: list[int] = []
-    monkeypatch.setattr(d, "_decode_one", lambda nalu, ti: decoded.append(ti))
+    monkeypatch.setattr(d, "_decode_one", lambda nalu, ti, ts: decoded.append(ti))
     q = d._queue
     for ti in range(10):
-        q.put_nowait((_VPS, ti))
+        q.put_nowait((_VPS, ti, None))
     d._resync_pending = True
 
     t = threading.Thread(target=d._worker_loop, daemon=True)
@@ -90,7 +90,7 @@ def test_worker_discards_backlog_then_keeps_decoding(monkeypatch):
         if q.qsize() == 0 and d.decode_queue_resyncs:
             break
         threading.Event().wait(0.005)
-    q.put_nowait((_VPS, 99))
+    q.put_nowait((_VPS, 99, None))
     q.put_nowait(None)                                  # stop sentinel
     t.join(timeout=2)
 

@@ -260,6 +260,9 @@ def _disable_udp_connreset(sock: socket.socket) -> None:
         log.debug("SIO_UDP_CONNRESET not disabled: %s", e)
 
 
+# How many recent RTP timestamps `fed_tiles` remembers (~2 s at 60 fps).
+_FED_BY_TS_MAX = 128
+
 # ISS_LAT_TRACE=1: log per-stage picture latency every 5 s (diagnostic).
 _LAT_TRACE = os.environ.get("ISS_LAT_TRACE") == "1"
 
@@ -668,6 +671,10 @@ class Session:
         self._ltr_acks_sent: int = 0
         self._lat_arrival: dict[int, float] = {}
         self._lat_grp: dict[tuple[int, int], list[float]] = {}
+        # RTP timestamp → tiles handed a picture with it (newest last,
+        # bounded). Written by the video RX thread; frozensets are replaced,
+        # never mutated, so the render thread reads them without a lock.
+        self._fed_by_ts: dict[int, frozenset[int]] = {}
         self._lat_samples: list[tuple] = []
         self._lat_last_log = 0.0
         # The per-ack LTR log fires at frame rate and drowns the debug log
@@ -3022,8 +3029,23 @@ class Session:
         else:
             if _LAT_TRACE:
                 self._lat_push(key, ti)
+            if nalus:
+                self._note_fed(key[1], ti)
             for nalu in nalus:
-                self._decoder.feed_nalu(nalu, ti, donl=donl)
+                self._decoder.feed_nalu(nalu, ti, donl=donl, rtp_ts=key[1])
+
+    def _note_fed(self, rtp_ts: int, ti: int) -> None:
+        """Record that tile `ti` was handed a picture stamped `rtp_ts`."""
+        fed = self._fed_by_ts
+        fed[rtp_ts] = fed.get(rtp_ts, frozenset()) | {ti}
+        if len(fed) > _FED_BY_TS_MAX:
+            fed.pop(next(iter(fed)), None)
+
+    def fed_tiles(self, rtp_ts: int) -> frozenset[int]:
+        """Tiles handed a picture stamped `rtp_ts` so far. Apple stamps every
+        tile of one frame with the same timestamp, so the desktop frontend
+        waits for these before presenting the frame (one present per frame)."""
+        return self._fed_by_ts.get(rtp_ts, frozenset())
 
     def _lat_push(self, key: tuple[int, int], ti: Optional[int]) -> None:
         """ISS_LAT_TRACE: hand the picture's arrival times to the decoder."""

@@ -7,6 +7,7 @@ media subpackage.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 
 @dataclass(slots=True, frozen=True)
@@ -28,6 +29,11 @@ class TileFrame:
     Plane data is any buffer: `bytes`, or a zero-copy `memoryview` onto a
     decoded `av.VideoFrame` plane (the libav decoders). Consumers read it via
     the buffer protocol (e.g. `np.frombuffer`) and must not write to it.
+
+    `rtp_ts` is the RTP timestamp of the picture this tile came from, when
+    the decoder can tell (None otherwise). Apple sends one picture per tile
+    per frame, all with the frame's timestamp, so a frontend can use it to
+    present once per frame instead of once per tile.
     """
     y: bytes | memoryview
     u: bytes | memoryview
@@ -38,6 +44,7 @@ class TileFrame:
     uv_stride: int
     chroma_width: int
     chroma_height: int
+    rtp_ts: Optional[int] = None
 
     @property
     def is_nv12_passthrough(self) -> bool:
