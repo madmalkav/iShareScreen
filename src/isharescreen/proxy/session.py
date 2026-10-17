@@ -4520,7 +4520,7 @@ class Session:
         ltr_dist = getattr(rps, "max_ref_distance", 0)
         ltr_miss = getattr(rps, "missing_ref_events", 0)
         log.debug(
-            "profile: decoder=%s tiles=%s rates=%s clean_rates=%s shown_rates=%s gray_tiles=%s fps tile_KBs=%s loss/tile=%s "
+            "profile: decoder=%s tiles=%s rates=%s clean_rates=%s shown_rates=%s gray_tiles=%s fps corrupt_shown=%s tile_KBs=%s loss/tile=%s "
             "ltr=ack%d/far%d/dist%d/miss%d "
             "loss_total=%d unmapped=%d "
             "ssrc_groups=%d last_publish=%.1fs ago "
@@ -4529,7 +4529,8 @@ class Session:
             "tx_pps=%.2f cursor=%dms_ago/n=%d tcp_types={%s} "
             "nalu={%s}",
             decoder_name,
-            good, rates, clean_rates, shown_rates, sorted(self._decoder.bad_tiles), tile_kbs, loss_delta,
+            good, rates, clean_rates, shown_rates, sorted(self._decoder.bad_tiles),
+            getattr(self._decoder, "corrupt_shown", "-"), tile_kbs, loss_delta,
             self._ltr_acks_sent, ltr_far, ltr_dist, ltr_miss,
             loss_total, loss_unmapped,
             ssrc_groups,
