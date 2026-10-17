@@ -141,6 +141,11 @@ _FRAME_RECOVERY = os.environ.get("ISS_FRAME_RECOVERY", "1") != "0"
 _CODEC_FLAG_OUTPUT_CORRUPT = 0x00000008
 _HEVC_CODEC_FLAGS = _CODEC_FLAG_LOW_DELAY | (
     _CODEC_FLAG_OUTPUT_CORRUPT if _FRAME_RECOVERY else 0)
+# Don't show damaged frames: the tile keeps its last good picture until a
+# clean frame (after the keyframe its damage requested) arrives, instead of
+# showing visibly broken pictures. Needs _FRAME_RECOVERY (the flag is the
+# signal). ISS_HIDE_DAMAGED=0: show them, as before.
+_HIDE_DAMAGED = _FRAME_RECOVERY and os.environ.get("ISS_HIDE_DAMAGED", "1") != "0"
 
 
 def _loaded_va_driver(maps_path: str = "/proc/self/maps") -> Optional[str]:
@@ -284,6 +289,10 @@ class HevcDecoder:
         self._pinned = PinnedDownloader(num_tiles)
         # Frames flagged corrupt that were shown, per tile (profile line).
         self.corrupt_shown: list[int] = [0] * num_tiles
+        # Damaged frames hidden per tile (profile line), and the session's
+        # hook for them: on_frame_hidden(tile, rtp_ts) from the decode thread.
+        self.corrupt_hidden: list[int] = [0] * num_tiles
+        self.on_frame_hidden = None
         self._cuda_primary = False
         self._gate = FrameQualityGate(num_tiles, enabled=enable_quality_gate)
         self._tiles: list[_TileSlot] = [_TileSlot() for _ in range(num_tiles)]
@@ -949,6 +958,18 @@ class HevcDecoder:
         had_error = bool(err) or bool(flg & 0x01)
         if _FRAME_RECOVERY:
             had_error = bool(getattr(frame, "is_corrupt", False))
+        if had_error and _HIDE_DAMAGED:
+            # Keep the tile's last good picture; ask for a keyframe. Still
+            # decoder output (the no-output wedge watch counts it), but not
+            # published: no LTR ack for a damaged frame.
+            self.corrupt_hidden[ti] += 1
+            self._gate.mark_decode_error(ti)
+            if self.on_frame_hidden is not None:
+                try:
+                    self.on_frame_hidden(ti, rtp_ts)
+                except Exception as e:
+                    log.debug("on_frame_hidden callback raised: %s", e)
+            return
 
         slot = self._tiles[ti]
         with slot.lock:

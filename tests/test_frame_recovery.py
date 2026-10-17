@@ -76,3 +76,80 @@ def test_opt_out_reads_frames_as_before(monkeypatch):
     _show(d, 1, True)
     assert d._gate._keyframe_required == set()    # old: flag never read
     assert d.corrupt_shown == [0, 1, 0, 0]        # still counted
+
+
+# ── hiding damaged frames (hevc.py `_HIDE_DAMAGED`) ──────────────────────
+
+def _fake(pts, corrupt):
+    return types.SimpleNamespace(pts=pts, is_corrupt=corrupt)
+
+
+def _pub_decoder():
+    d = HevcDecoder(4)
+    d._hw_name = None
+    d._gate._POST_IDR_GRACE_S = 0.0
+    return d
+
+
+def test_damaged_frame_is_hidden_and_reported():
+    d = _pub_decoder()
+    calls = []
+    d.on_frame_hidden = lambda ti, ts: calls.append((ti, ts))
+    d._pts_to_tile[5] = 2
+    d._pts_to_ts[5] = 777
+    d._publish_frame(_fake(5, True))
+    assert d._tiles[2].raw_frame is None          # last good picture stays
+    assert d._tiles[2].good_count == 0
+    assert d.corrupt_hidden == [0, 0, 1, 0]
+    assert d._gate._keyframe_required == {2}
+    assert calls == [(2, 777)]
+
+
+def test_clean_frame_still_publishes():
+    d = _pub_decoder()
+    d._pts_to_tile[6] = 1
+    frame = _fake(6, False)
+    d._publish_frame(frame)
+    assert d._tiles[1].raw_frame is frame
+    assert d.corrupt_hidden == [0, 0, 0, 0]
+
+
+def test_show_opt_out(monkeypatch):
+    monkeypatch.setattr(hevc, "_HIDE_DAMAGED", False)
+    d = _pub_decoder()
+    d._pts_to_tile[7] = 0
+    frame = _fake(7, True)
+    d._publish_frame(frame)
+    assert d._tiles[0].raw_frame is frame
+    assert (d._tiles[0].good_count, d._tiles[0].clean_count) == (1, 0)
+
+
+def test_session_drops_a_hidden_tile_from_its_frame():
+    from isharescreen.proxy import session as sess
+    import threading
+    s = sess.Session.__new__(sess.Session)
+    s._fed_by_ts = {}
+    s._newest_fed_ts = None
+    s._fresh_evt = threading.Event()
+    for ti in range(4):
+        s._note_fed(1000, ti)
+    s._on_frame_hidden(2, 1000)
+    assert s.fed_tiles(1000) == {0, 1, 3}         # the present won't wait for it
+    assert s._fresh_evt.is_set()
+    s._on_frame_hidden(1, None)                   # no timestamp: nothing to drop
+    assert s.fed_tiles(1000) == {0, 1, 3}
+
+
+def test_hiding_the_last_tile_still_ends_the_frame():
+    from isharescreen.proxy import session as sess
+    import threading
+    s = sess.Session.__new__(sess.Session)
+    s._fed_by_ts = {}
+    s._newest_fed_ts = None
+    s._observed_tile_count = 4
+    s._fresh_evt = threading.Event()
+    for ti in range(4):
+        s._note_fed(2000, ti)
+    s._on_frame_hidden(3, 2000)
+    assert s.fed_tiles(2000) == {0, 1, 2}
+    assert s.frame_sent(2000)                     # tile 3 arrived: no 5 ms wait
