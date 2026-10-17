@@ -125,6 +125,23 @@ _WORKER_DEQUEUE_TIMEOUT_S = 0.5
 # in, =0 disables it everywhere.
 _HW_FRAMES_ON_GPU = os.environ.get("ISS_HW_FRAMES_ON_GPU", "")
 
+# Damage and recovery from the frames themselves. libav flags a frame
+# `is_corrupt` when a reference it needs is missing or damaged, and the flag
+# matches real pixel damage exactly (offline, S4 with random loss: every
+# damaged frame flagged, none flagged without damage). So a flagged frame
+# marks its tile for a keyframe, and a tile has recovered once a frame after
+# the keyframe decodes unflagged. This replaces the IDR-size rule ("an IDR
+# under 40 % of recent ones is fake"), which rejected genuine keyframes on
+# calm content (S4: 21 of 24, including one that fully repaired the tile)
+# and kept a FIR going every second for the whole session. Frames are still
+# shown either way. ISS_FRAME_RECOVERY=0: the old behaviour.
+_FRAME_RECOVERY = os.environ.get("ISS_FRAME_RECOVERY", "1") != "0"
+# AV_CODEC_FLAG_OUTPUT_CORRUPT: hand flagged frames over instead of dropping
+# them (libav's default; assigning `flags` clears it).
+_CODEC_FLAG_OUTPUT_CORRUPT = 0x00000008
+_HEVC_CODEC_FLAGS = _CODEC_FLAG_LOW_DELAY | (
+    _CODEC_FLAG_OUTPUT_CORRUPT if _FRAME_RECOVERY else 0)
+
 
 def _loaded_va_driver(maps_path: str = "/proc/self/maps") -> Optional[str]:
     """Name of the VA-API driver loaded into this process (e.g. "nvidia",
@@ -265,6 +282,8 @@ class HevcDecoder:
         # CUDA frames kept on the GPU are downloaded into pinned memory
         # (cuda_download.py) when FFmpeg runs on the primary context.
         self._pinned = PinnedDownloader(num_tiles)
+        # Frames flagged corrupt that were shown, per tile (profile line).
+        self.corrupt_shown: list[int] = [0] * num_tiles
         self._cuda_primary = False
         self._gate = FrameQualityGate(num_tiles, enabled=enable_quality_gate)
         self._tiles: list[_TileSlot] = [_TileSlot() for _ in range(num_tiles)]
@@ -621,6 +640,11 @@ class HevcDecoder:
 
         if tile_frame is None:
             return None
+        corrupt = bool(getattr(frame, "is_corrupt", False))
+        if corrupt:
+            self.corrupt_shown[tile_idx] += 1     # diagnostic, both modes
+        if _FRAME_RECOVERY:
+            had_decode_error = corrupt
         # libavcodec flagged this frame as concealed / corrupt — fire
         # FIR immediately so the next IDR closes the failure window.
         # The frame is still published so the operator sees the
@@ -758,8 +782,11 @@ class HevcDecoder:
             # engage, would stay perpetually flagged in
             # `keyframe_required`, and we'd FIR them forever waiting
             # for IDRs Apple architecturally won't send.
+            # With frame recovery the size rule only logs: the gate waits
+            # for an unflagged frame after the IDR instead.
+            gate_suspicious = suspicious and not _FRAME_RECOVERY
             for ti in range(len(self._tiles)):
-                self._gate.mark_idr_observed(ti, suspicious=suspicious)
+                self._gate.mark_idr_observed(ti, suspicious=gate_suspicious)
             # Diagnostic: every IDR arrival. The "gate opens" log only
             # fires once per reset so it under-reports actual IDR
             # cadence; this DEBUG line is ground truth.
@@ -920,6 +947,8 @@ class HevcDecoder:
         err = getattr(frame, "decode_error_flags", 0)
         flg = getattr(frame, "flags", 0)
         had_error = bool(err) or bool(flg & 0x01)
+        if _FRAME_RECOVERY:
+            had_error = bool(getattr(frame, "is_corrupt", False))
 
         slot = self._tiles[ti]
         with slot.lock:
@@ -1251,7 +1280,7 @@ class HevcDecoder:
             # ignores this setting.
             c.thread_type = "SLICE"
             c.thread_count = 0
-            c.flags = _CODEC_FLAG_LOW_DELAY
+            c.flags = _HEVC_CODEC_FLAGS
             c.flags2 = _CODEC_FLAG2_FAST
             c.open()
             return c
@@ -1304,7 +1333,7 @@ class HevcDecoder:
         c.extradata = extradata
         c.thread_type = "SLICE"
         c.thread_count = 0
-        c.flags = _CODEC_FLAG_LOW_DELAY
+        c.flags = _HEVC_CODEC_FLAGS
         c.flags2 = _CODEC_FLAG2_FAST
         c.open()
         return c
