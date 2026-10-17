@@ -26,6 +26,7 @@ from .audio_sink import make_audio_sink
 from .canvas import WaylandSafeCanvas, fit_size, fit_window_to_screen, lock_aspect, usable_screen_area
 from .gpu import Renderer
 from .keymap import GLFW_KEY_TO_X11, glfw_button_to_rfb_bit
+from .present import make_coalescer
 
 
 # X11 keysyms for the Cmd-equivalent (Super_L / Super_R). When Ctrl→Cmd
@@ -224,6 +225,7 @@ def run(
     auto_quit_secs: int = 0,
     display: int = -1,
     display_all: bool = False,
+    present_policy: str = "frame",
     **_unused: object,
 ) -> int:
     """Open the window streaming `config`. Blocks until close (or
@@ -240,7 +242,11 @@ def run(
     windows; the user drags each window onto a local monitor and maximizes it.
     A single-monitor host stays one window with dynamic resolution intact, so
     the common case is unchanged. `display_all=False` (--display combined)
-    keeps the whole stacked canvas in one window."""
+    keeps the whole stacked canvas in one window.
+
+    `present_policy` "frame" (default) presents once per frame, when all
+    its tiles are uploaded; "tile" presents after every fresh tile (see
+    `present.py`)."""
     log.info("opening desktop frontend → %s", config.host)
     # In display_all/auto mode we deliberately DON'T force `display` to a monitor
     # index here. Doing so would disable dynamic resolution (below) for every
@@ -916,6 +922,8 @@ def run(
     # ── render loop ────────────────────────────────────────────────────
     first_seen: list[bool] = [False] * num_tiles
     slot_h_resolved = False
+    # One present per frame (None = present per tile); see present.py.
+    coalescer = make_coalescer(present_policy)
     # Last cursor position we painted, so a pointer move over a static
     # screen still repaints the overlay (the cursor isn't baked into video).
     _last_drawn_cursor: "Optional[tuple[int, int]]" = None
@@ -1447,26 +1455,41 @@ def run(
         session.wait_for_fresh_tile(timeout=_FRESH_TILE_WAIT_S)
 
         # Drain fresh decoded frames + upload.
-        any_fresh = False
-        for ti in range(num_tiles):
-            tf = session.get_frame(ti)
-            if tf is None:
-                continue
-            # A leftover from before a canvas shrink must neither be drawn
-            # (it overruns the new textures) nor resolve slot_h below.
-            if _is_stale_tile(tf, canvas_w):
-                log.debug("skipping stale %d-wide tile %d for %d-wide canvas",
-                          tf.width, ti, canvas_w)
-                continue
-            first_seen[ti] = True
-            # Refine slot_h on the first tile — encoder's CTU-padded
-            # picture height (typically 4 rows taller than canvas_h//
-            # num_tiles). See comment at session-ready above.
-            if not slot_h_resolved:
-                slot_h = tf.height
-                slot_h_resolved = True
-            renderer.upload_tile(ti, tf, slot_h)
-            any_fresh = True
+        def _drain() -> bool:
+            nonlocal slot_h, slot_h_resolved
+            fresh = False
+            for ti in range(num_tiles):
+                tf = session.get_frame(ti)
+                if tf is None:
+                    continue
+                # A leftover from before a canvas shrink must neither be drawn
+                # (it overruns the new textures) nor resolve slot_h below.
+                if _is_stale_tile(tf, canvas_w):
+                    log.debug("skipping stale %d-wide tile %d for %d-wide canvas",
+                              tf.width, ti, canvas_w)
+                    continue
+                first_seen[ti] = True
+                # Refine slot_h on the first tile — encoder's CTU-padded
+                # picture height (typically 4 rows taller than canvas_h//
+                # num_tiles). See comment at session-ready above.
+                if not slot_h_resolved:
+                    slot_h = tf.height
+                    slot_h_resolved = True
+                renderer.upload_tile(ti, tf, slot_h)
+                if coalescer is not None:
+                    coalescer.note_upload(ti, tf.rtp_ts)
+                fresh = True
+            return fresh
+
+        any_fresh = _drain()
+        if any_fresh and coalescer is not None:
+            # One present per frame: wait for the newest frame's other tiles.
+            coalescer.wait_for_frame(
+                session.fed_tiles,
+                lambda t: session.wait_for_fresh_tile(timeout=t),
+                _drain,
+                session.frame_sent,
+            )
 
         # Present after a fresh upload, OR when the overlay cursor moved or
         # changed shape — otherwise a pointer that moves/reshapes over a

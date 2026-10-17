@@ -313,10 +313,13 @@ class QsvHevcDecoder:
         good = sum(t.good_count for t in self._tiles)
         log.info("qsv burst complete: fed %d NALUs, decoded %d frames", fed, good)
 
-    def feed_nalu(self, nalu: bytes, tile_idx: int, donl: Optional[int] = None) -> None:
+    def feed_nalu(self, nalu: bytes, tile_idx: int, donl: Optional[int] = None,
+                  rtp_ts: Optional[int] = None) -> None:
         """Accumulate NALUs into an access unit; submit the AU when its VCL
         slice arrives (Apple = one slice per tile picture). Parameter-set NALUs
-        ride inline with the slice.
+        ride inline with the slice. `rtp_ts` is accepted for API parity and
+        not tracked: QSV tiles carry `rtp_ts=None`, so the desktop frontend
+        presents them per tile.
 
         `donl` is accepted for interface parity with HevcDecoder (the session
         passes it for the LTR-ack path), but QSV manages its own DPB and we

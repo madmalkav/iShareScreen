@@ -252,6 +252,8 @@ class AvcDecoder:
         self._next_pts = 0
         self._pts_to_tile: dict[int, int] = {}
         self._pts_submit_t: dict[int, float] = {}
+        # RTP timestamp per pts, for slices fed with one (TileFrame.rtp_ts).
+        self._pts_to_ts: dict[int, int] = {}
         self._reformatter: list = [None]
         self._seen_fmts: set = set()
         self._gate = FrameQualityGate(num_tiles, enabled=enable_quality_gate)
@@ -395,7 +397,8 @@ class AvcDecoder:
             for nalu in nalus:
                 self.feed_nalu(nalu, ti)
 
-    def feed_nalu(self, nalu: bytes, tile_idx: int, donl: Optional[int] = None) -> None:
+    def feed_nalu(self, nalu: bytes, tile_idx: int, donl: Optional[int] = None,
+                  rtp_ts: Optional[int] = None) -> None:
         if not nalu or not (0 <= tile_idx < self.num_tiles):
             return
         t = h264_nal_type(nalu[0])
@@ -483,6 +486,8 @@ class AvcDecoder:
             self._next_pts += 1
             self._pts_to_tile[pts] = tile_idx
             self._pts_submit_t[pts] = _time.monotonic()
+            if rtp_ts is not None:
+                self._pts_to_ts[pts] = rtp_ts
             if len(self._pts_to_tile) > _PTS_MAP_SOFT_MAX:
                 cutoff = pts - _PTS_MAP_PRUNE_KEEP
                 self._pts_to_tile = {
@@ -490,6 +495,9 @@ class AvcDecoder:
                 }
                 self._pts_submit_t = {
                     k: v for k, v in self._pts_submit_t.items() if k > cutoff
+                }
+                self._pts_to_ts = {
+                    k: v for k, v in self._pts_to_ts.items() if k > cutoff
                 }
             try:
                 _t_dec = _time.perf_counter()
@@ -503,6 +511,7 @@ class AvcDecoder:
                 # map doesn't leak the in-flight entry.
                 self._pts_to_tile.pop(pts, None)
                 self._pts_submit_t.pop(pts, None)
+                self._pts_to_ts.pop(pts, None)
                 if reset_for_this_key:
                     # The recovery intra picture itself was unusable. Keep
                     # deltas gated and wait for the sticky FIR loop's retry
@@ -515,6 +524,7 @@ class AvcDecoder:
             for frame in frames:
                 ti = self._pts_to_tile.pop(frame.pts, tile_idx)
                 submit_t = self._pts_submit_t.pop(frame.pts, None)
+                frame_ts = self._pts_to_ts.pop(frame.pts, None)
                 # The libav log handler can arm recovery synchronously as
                 # ctx.decode(pkt) returns. Never publish that same concealed frame:
                 # hold the last known-good picture while deltas are gated and
@@ -533,6 +543,7 @@ class AvcDecoder:
                 slot = self._tiles[ti]
                 with slot.lock:
                     slot.raw_frame = frame
+                    slot.raw_ts = frame_ts
                     slot.good_count += 1
                 published.append(ti)
         # Notify outside the codec lock to avoid holding it across the callback.
@@ -626,12 +637,13 @@ class AvcDecoder:
         slot = self._tiles[tile_idx]
         with slot.lock:
             frame = slot.raw_frame
+            rtp_ts = slot.raw_ts
             count = slot.good_count
             already = count <= slot.last_evaluated_count
         if frame is None or already:
             return None
         tile_frame, had_error = _av_frame_to_tile(
-            frame, self._reformatter, self._seen_fmts,
+            frame, self._reformatter, self._seen_fmts, rtp_ts=rtp_ts,
         )
         with slot.lock:
             slot.last_evaluated_count = count
@@ -738,6 +750,7 @@ class AvcDecoder:
             self._codec = None
         self._pts_to_tile.clear()
         self._pts_submit_t.clear()
+        self._pts_to_ts.clear()
         self._dpb_ready = False
         self._await_key = True
         self._decode_latency_ms = 0.0

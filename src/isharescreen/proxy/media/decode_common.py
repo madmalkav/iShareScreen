@@ -86,6 +86,8 @@ class _TileSlot:
     the decode worker (writer) and the consumer's `get_frame()` (reader)
     don't tear."""
     raw_frame: Optional[av.VideoFrame] = None
+    # RTP timestamp of the picture `raw_frame` came from (None if unknown).
+    raw_ts: Optional[int] = None
     good_count: int = 0
     # Frames published WITHOUT a libav decode-error flag — i.e. actually
     # clean video, not concealed gray. `good_count` counts every published
@@ -128,6 +130,7 @@ def _av_frame_to_tile(
     seen_fmts: set[str],
     *,
     copy: bool = False,
+    rtp_ts: Optional[int] = None,
 ) -> tuple[Optional[TileFrame], bool]:
     """Convert an `av.VideoFrame` to our `TileFrame`.
 
@@ -139,7 +142,8 @@ def _av_frame_to_tile(
     to the operator than a frozen tile).
 
     Planes are zero-copy views unless `copy=True` (see below); QSV passes
-    `copy=True` so its surfaces are never touched outside its codec lock."""
+    `copy=True` so its surfaces are never touched outside its codec lock.
+    `rtp_ts` is passed through to the tile (see `TileFrame.rtp_ts`)."""
     err = getattr(frame, "decode_error_flags", 0)
     flg = getattr(frame, "flags", 0)
     had_error = bool(err) or bool(flg & 0x01)
@@ -206,6 +210,7 @@ def _av_frame_to_tile(
             uv_stride=up.line_size,
             chroma_width=width // 2,
             chroma_height=height // 2,
+            rtp_ts=rtp_ts,
         ), had_error
 
     if fmt in ("yuv444p", "yuvj444p"):
@@ -217,6 +222,7 @@ def _av_frame_to_tile(
             uv_stride=up.line_size,
             chroma_width=width,
             chroma_height=height,
+            rtp_ts=rtp_ts,
         ), had_error
 
     log.warning("unsupported decoded frame format: %s", fmt)

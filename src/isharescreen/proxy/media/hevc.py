@@ -330,6 +330,8 @@ class HevcDecoder:
         self._next_pts = 0
         self._pts_to_tile: dict[int, int] = {}
         self._pts_submit_t: dict[int, float] = {}
+        # RTP timestamp per pts, for slices fed with one (TileFrame.rtp_ts).
+        self._pts_to_ts: dict[int, int] = {}
         self._decode_latency_ms: float = 0.0
         # ISS_LAT_TRACE: per-tile FIFO of (first_arrival, last_arrival, fed)
         # pushed by the session per picture; matched to the slice at decode
@@ -488,7 +490,8 @@ class HevcDecoder:
             )
             self._fallback_to_software(tile_nalu_cache)
 
-    def feed_nalu(self, nalu: bytes, tile_idx: int, donl: Optional[int] = None) -> None:
+    def feed_nalu(self, nalu: bytes, tile_idx: int, donl: Optional[int] = None,
+                  rtp_ts: Optional[int] = None) -> None:
         """Send one NALU to the shared decoder. During `feed_burst` this
         runs synchronously; otherwise it enqueues to the decoder worker
         (libavcodec releases the GIL inside `decode()`).
@@ -540,7 +543,7 @@ class HevcDecoder:
                     # IDR within ~200 ms which closes the window.
                     self._gate.mark_decode_error(tile_idx)
         if self._sync_decode_mode:
-            self._decode_one(nalu, tile_idx)
+            self._decode_one(nalu, tile_idx, rtp_ts)
             return
         if self._queue is None or self._worker is None or not self._worker.is_alive():
             self._start_worker()
@@ -556,7 +559,7 @@ class HevcDecoder:
         if q is None:
             return
         try:
-            q.put_nowait((nalu, tile_idx))
+            q.put_nowait((nalu, tile_idx, rtp_ts))
             if q.qsize() >= _QUEUE_RESYNC_AT:
                 self._resync_pending = True
         except queue.Full:
@@ -593,6 +596,7 @@ class HevcDecoder:
         slot = self._tiles[tile_idx]
         with slot.lock:
             frame = slot.raw_frame
+            rtp_ts = slot.raw_ts
             count = slot.good_count
             already_evaluated = count <= slot.last_evaluated_count
 
@@ -600,7 +604,7 @@ class HevcDecoder:
             return None
 
         tile_frame, had_decode_error = _av_frame_to_tile(
-            frame, self._reformatter, self._seen_fmts,
+            frame, self._reformatter, self._seen_fmts, rtp_ts=rtp_ts,
         )
         with slot.lock:
             slot.last_evaluated_count = count
@@ -694,7 +698,8 @@ class HevcDecoder:
 
     # -- internals: decode --------------------------------------------
 
-    def _decode_one(self, nalu: bytes, tile_idx: int) -> None:
+    def _decode_one(self, nalu: bytes, tile_idx: int,
+                    rtp_ts: Optional[int] = None) -> None:
         """Wrap one NALU in an `av.Packet`, attach a fresh PTS, run through
         the shared codec, and dispatch any output frames back to per-tile
         slots via the PTS map."""
@@ -792,6 +797,8 @@ class HevcDecoder:
         self._pts_to_tile[pts] = tile_idx
         import time as _time
         self._pts_submit_t[pts] = _time.monotonic()
+        if rtp_ts is not None:
+            self._pts_to_ts[pts] = rtp_ts
         _lf = getattr(self, "_lat_fifo", None)
         if _lf and nalu and (nalu[0] >> 1) & 0x3F < 32:     # a slice
             fifo = _lf.get(tile_idx)
@@ -804,6 +811,7 @@ class HevcDecoder:
             cutoff = pts - _PTS_MAP_PRUNE_KEEP
             self._pts_to_tile = {k: v for k, v in self._pts_to_tile.items() if k > cutoff}
             self._pts_submit_t = {k: v for k, v in self._pts_submit_t.items() if k > cutoff}
+            self._pts_to_ts = {k: v for k, v in self._pts_to_ts.items() if k > cutoff}
 
         try:
             with self._codec_lock:
@@ -878,6 +886,7 @@ class HevcDecoder:
 
         ti = self._pts_to_tile.pop(frame.pts, None)
         submit_t = self._pts_submit_t.pop(frame.pts, None)
+        rtp_ts = self._pts_to_ts.pop(frame.pts, None)
         if ti is None:
             # PTS aged out of the map (rare on healthy streams; can happen
             # if libavcodec reordered output and our prune fired between).
@@ -904,6 +913,7 @@ class HevcDecoder:
         slot = self._tiles[ti]
         with slot.lock:
             slot.raw_frame = frame
+            slot.raw_ts = rtp_ts
             slot.good_count += 1
             if not had_error:
                 slot.clean_count += 1
@@ -1160,11 +1170,11 @@ class HevcDecoder:
             # The dequeued slice is part of the backlog being discarded.
             if self._resync_pending and self._overload_resync():
                 continue
-            nalu, tile_idx = item
+            nalu, tile_idx, rtp_ts = item
             if _DECODE_DELAY_S:
                 self._stop.wait(_DECODE_DELAY_S)
             try:
-                self._decode_one(nalu, tile_idx)
+                self._decode_one(nalu, tile_idx, rtp_ts)
             except Exception as e:
                 log.warning("hevc-decode worker swallowed error: %s", e)
 
@@ -1289,6 +1299,7 @@ class HevcDecoder:
         self._next_pts = 0
         self._pts_to_tile = {}
         self._pts_submit_t = {}
+        self._pts_to_ts = {}
         self._decode_latency_ms = 0.0
         log.info("HEVC decoder: shared context (%s)", hw_name or "software")
         # NALU dump diagnostic: prepend VPS+SPS+all-PPSes (Annex-B) so a
@@ -1349,6 +1360,7 @@ class HevcDecoder:
         for slot in self._tiles:
             with slot.lock:
                 slot.raw_frame = None
+                slot.raw_ts = None
                 slot.good_count = 0
                 slot.clean_count = 0
                 slot.last_evaluated_count = 0
@@ -1359,6 +1371,7 @@ class HevcDecoder:
         self._next_pts = 0
         self._pts_to_tile = {}
         self._pts_submit_t = {}
+        self._pts_to_ts = {}
         self._decode_latency_ms = 0.0
         self._dpb_has_idr = False
         self._tiles_await_idr.clear()

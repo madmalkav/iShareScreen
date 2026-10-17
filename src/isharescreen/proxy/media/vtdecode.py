@@ -227,7 +227,8 @@ class VTHevcDecoder:
                     self.feed_nalu(nalus[idx], ti)
 
     def feed_nalu(self, nalu: bytes, tile_idx: int,
-                  donl: Optional[int] = None) -> None:
+                  donl: Optional[int] = None,
+                  rtp_ts: Optional[int] = None) -> None:
         """Wrap one NAL unit in a length-prefixed CMSampleBuffer and submit it
         for async decode. The output is dispatched to `tile_idx` by the closure
         below. No RPS pre-check / no drop: VT manages its own DPB and conceals
@@ -236,7 +237,9 @@ class VTHevcDecoder:
         `donl` (the libav path's HEVC decoding-order number, used there for
         DON-based LTRP reference tracking) is accepted for API parity with
         `HevcDecoder.feed_nalu` and intentionally ignored: VideoToolbox owns
-        its own DPB + decode ordering, so iss does not steer its references."""
+        its own DPB + decode ordering, so iss does not steer its references.
+        `rtp_ts` is likewise accepted and not tracked: VT tiles carry
+        `rtp_ts=None`, so the desktop frontend presents them per tile."""
         session = self._session
         if session is None or not nalu:
             return
