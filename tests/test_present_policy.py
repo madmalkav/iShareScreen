@@ -150,9 +150,16 @@ def test_policy_and_env_override(monkeypatch):
     assert make_coalescer("frame") is None
 
 
-def test_session_records_fed_tiles_per_timestamp():
+def _session(num_tiles=4):
     s = sess.Session.__new__(sess.Session)
     s._fed_by_ts = {}
+    s._newest_fed_ts = None
+    s._observed_tile_count = num_tiles
+    return s
+
+
+def test_session_records_fed_tiles_per_timestamp():
+    s = _session()
     s._note_fed(_TS, 0)
     s._note_fed(_TS, 3)
     s._note_fed(_TS + 1500, 1)
@@ -184,3 +191,65 @@ def test_hevc_decoder_carries_the_timestamp_to_the_tile_frame():
     d._dpb_has_idr = True
     tf = d.get_frame(2)
     assert tf is not None and tf.rtp_ts == _TS
+
+
+# ── is the host done sending a frame? (tiles come in index order) ─────────
+
+def _clock_at(monkeypatch, t):
+    monkeypatch.setattr(sess.time, "monotonic", lambda: t[0])
+
+
+def test_last_tile_index_ends_the_frame_at_once(monkeypatch):
+    t = [10.0]
+    _clock_at(monkeypatch, t)
+    s = _session()
+    for ti in (1, 2, 3):                  # tile 0 unchanged: not sent
+        s._note_fed(_TS, ti)
+    assert s.frame_sent(_TS)
+
+
+def test_a_frame_without_the_last_tile_waits_for_the_gap(monkeypatch):
+    t = [10.0]
+    _clock_at(monkeypatch, t)
+    s = _session()
+    s._note_fed(_TS, 0)                   # tile 1 may still be in flight
+    assert not s.frame_sent(_TS)
+    t[0] += sess._FRAME_TILE_GAP_S - 0.001
+    assert not s.frame_sent(_TS)
+    t[0] += 0.002                          # nothing more came: done
+    assert s.frame_sent(_TS)
+
+
+def test_a_newer_frame_ends_the_previous_one(monkeypatch):
+    t = [10.0]
+    _clock_at(monkeypatch, t)
+    s = _session()
+    s._note_fed(_TS, 0)
+    s._note_fed(_TS + 1500, 0)
+    assert s.frame_sent(_TS)
+    assert not s.frame_sent(_TS + 1500)
+
+
+def test_unknown_frames_do_not_wait():
+    assert _session().frame_sent(42)
+
+
+def test_coalescer_holds_a_frame_whose_last_tile_is_in_flight():
+    c, clock, s = _setup()
+    t0 = clock.t
+    s.fed = {_TS: {0, 1, 2}}             # tile 3's packets not here yet
+    sent = {"v": False}
+    s.pending = [(t0, 0, _TS), (t0, 1, _TS), (t0, 2, _TS)]
+    s.drain()
+    assert c.frame_complete(s.fed_tiles)                     # old rule: done
+    assert not c.frame_complete(s.fed_tiles, lambda ts: sent["v"])
+
+    def wait(timeout):                    # tile 3 arrives 3 ms later
+        s.wait_fresh(timeout)
+        if clock.t >= t0 + 0.003:
+            s.fed[_TS] = {0, 1, 2, 3}
+            sent["v"] = True
+            s.pending.append((clock.t, 3, _TS))
+    c.wait_for_frame(s.fed_tiles, wait, s.drain, lambda ts: sent["v"])
+    assert c.frame_complete(s.fed_tiles, lambda ts: sent["v"])
+    assert clock.t < t0 + 0.012                              # before the deadline

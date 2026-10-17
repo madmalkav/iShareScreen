@@ -87,26 +87,35 @@ class FrameCoalescer:
             newest = rtp_ts
         self._newest = newest
 
-    def frame_complete(self, fed_tiles: Callable[[int], Collection[int]]) -> bool:
-        """Every tile fed the newest frame has uploaded it (True when the
-        newest timestamp is unknown, so such tiles present right away)."""
+    def frame_complete(
+        self,
+        fed_tiles: Callable[[int], Collection[int]],
+        frame_sent: Optional[Callable[[int], bool]] = None,
+    ) -> bool:
+        """Every tile fed the newest frame has uploaded it, and (with
+        `frame_sent`) the host is done sending that frame, so no tile is
+        still in flight. True when the newest timestamp is unknown, so such
+        tiles present right away."""
         ts = self._newest
         if ts is None:
             return True
-        return all(self._uploaded.get(t) == ts for t in fed_tiles(ts))
+        if not all(self._uploaded.get(t) == ts for t in fed_tiles(ts)):
+            return False
+        return frame_sent is None or frame_sent(ts)
 
     def wait_for_frame(
         self,
         fed_tiles: Callable[[int], Collection[int]],
         wait_fresh: Callable[[float], object],
         drain: Callable[[], object],
+        frame_sent: Optional[Callable[[int], bool]] = None,
     ) -> None:
         """After a fresh upload: keep draining new tiles until the newest
         frame is complete or the deadline passes. `drain` uploads fresh tiles
         and calls `note_upload` for each; `wait_fresh(timeout)` blocks until a
         decoder publishes a tile, or the timeout elapses."""
         t_end = self._clock() + self.deadline_s
-        while not self.frame_complete(fed_tiles):
+        while not self.frame_complete(fed_tiles, frame_sent):
             remaining = t_end - self._clock()
             if remaining <= 0:
                 return

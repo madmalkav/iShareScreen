@@ -1488,6 +1488,7 @@ def run(
                 session.fed_tiles,
                 lambda t: session.wait_for_fresh_tile(timeout=t),
                 _drain,
+                session.frame_sent,
             )
 
         # Present after a fresh upload, OR when the overlay cursor moved or
