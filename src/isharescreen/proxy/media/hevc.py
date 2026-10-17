@@ -54,6 +54,7 @@ from collections import deque
 
 from . import libav_log as _libav_log
 from .tiles import TileFrame
+from .cuda_download import PinnedDownloader
 from .nalu import IDR_RANGE
 from .quality_gate import FrameQualityGate, TileVisState
 from .decode_common import (
@@ -261,6 +262,10 @@ class HevcDecoder:
         self._codec_lock = threading.Lock()
         self._reformatter: list[Optional[av.video.reformatter.VideoReformatter]] = [None]
         self._seen_fmts: set[str] = set()
+        # CUDA frames kept on the GPU are downloaded into pinned memory
+        # (cuda_download.py) when FFmpeg runs on the primary context.
+        self._pinned = PinnedDownloader(num_tiles)
+        self._cuda_primary = False
         self._gate = FrameQualityGate(num_tiles, enabled=enable_quality_gate)
         self._tiles: list[_TileSlot] = [_TileSlot() for _ in range(num_tiles)]
         # Per-tile cumulative NALU-type histogram. nal_unit_type is the
@@ -603,8 +608,13 @@ class HevcDecoder:
         if frame is None or already_evaluated:
             return None
 
+        download = None
+        pinned = getattr(self, "_pinned", None)
+        if getattr(self, "_cuda_primary", False) and pinned is not None and pinned.active:
+            download = lambda f: pinned.download(f, tile_idx)  # noqa: E731
         tile_frame, had_decode_error = _av_frame_to_tile(
             frame, self._reformatter, self._seen_fmts, rtp_ts=rtp_ts,
+            download=download,
         )
         with slot.lock:
             slot.last_evaluated_count = count
@@ -695,6 +705,7 @@ class HevcDecoder:
     def close(self) -> None:
         """Permanent shutdown. Stops the worker, releases the codec context."""
         self._teardown()
+        self._pinned.close()
 
     # -- internals: decode --------------------------------------------
 
@@ -1248,18 +1259,33 @@ class HevcDecoder:
             log.info("hwaccel %s unavailable: %s", hw_type, e)
             return None
 
-    @staticmethod
     def _gpu_frames_context(
-        hw_type: str,
+        self, hw_type: str,
     ) -> Optional[av.codec.context.CodecContext]:
         """A context for `hw_type` whose frames stay on the GPU (see
-        `_HW_FRAMES_ON_GPU`); None if this PyAV can't do that."""
+        `_HW_FRAMES_ON_GPU`); None if this PyAV can't do that. Records in
+        `_cuda_primary` whether a CUDA one runs on the primary context."""
         from av.codec.hwaccel import HWAccel
         try:
             hw = HWAccel(device_type=hw_type, is_hw_owned=True)
         except TypeError:            # PyAV without is_hw_owned
             return None
-        c = av.CodecContext.create("hevc", "r", hwaccel=hw)
+        c = None
+        self._cuda_primary = False
+        if hw_type == "cuda":
+            # On the device's primary context, so cuda_download.py can copy
+            # the frames into pinned memory. Falls back to FFmpeg's own
+            # context (PyAV's download) if that fails.
+            try:
+                c = av.CodecContext.create("hevc", "r", hwaccel=HWAccel(
+                    device_type="cuda", is_hw_owned=True,
+                    options={"primary_ctx": "1"}))
+            except Exception as e:
+                log.info("cuda primary context unavailable (%s); frames are "
+                         "downloaded by PyAV", e)
+            self._cuda_primary = c is not None and getattr(c, "is_hwaccel", False)
+        if c is None:
+            c = av.CodecContext.create("hevc", "r", hwaccel=hw)
         if not getattr(c, "is_hwaccel", False):
             return None
         log.info("hwaccel %s: decoded frames stay on the GPU; downloaded "
