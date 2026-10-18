@@ -119,7 +119,8 @@ guide is the README's "Codecs and decoders" section.
 #23 RTCP demux · #24 1×1 resize request · #25 RTCP liveness · #26/#28/#34/#38/#42/#43 docs · #29 control-message record split ·
 #30 one offer per message 1 + re-offer on wake · #31 `--max-bitrate` · #32 `--refresh-rate` · #33 800×600-point minimum ·
 #35 Windows UDP CONNRESET · #36 no NACKs/retransmit wait · #37 return to virtual display (layout flags) · #39 `ISS_LAT_TRACE` ·
-#40 faster connect · #41 precise scroll `0x17`. Open: #27 (AVC backlog guard for slow viewers, parked).
+#40 faster connect · #41 precise scroll `0x17`. Closed unmerged: #27 (AVC backlog guard for slow viewers; `--max-bitrate` covers it,
+  branch `fix/avc-backlog-guard` kept).
 
 Useful env switches: `ISS_HWACCEL`, `ISS_HW_SLOW_FALLBACK=0`, `ISS_PREFER_CUDA=0`, `ISS_HW_FRAMES_ON_GPU`, `ISS_RCTL=0`,
 `ISS_RCTL_BWE_KBPS`, `ISS_VIDEO_RTCP_ON_CTRL=1` (old routing), `ISS_OFFER_RESEND=1` + `ISS_REOFFER_ON_MSG1=0` (old offer
