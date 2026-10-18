@@ -681,11 +681,13 @@ class Session:
         self._ltr_acks_sent: int = 0
         self._lat_arrival: dict[int, float] = {}
         self._lat_grp: dict[tuple[int, int], list[float]] = {}
-        # RTP timestamp → (tiles handed a picture with it, monotonic time of
-        # the last one), newest last, bounded; and the newest timestamp fed.
-        # Written by the video RX thread; entries are replaced, never
-        # mutated, so the render thread reads them without a lock.
-        self._fed_by_ts: dict[int, tuple[frozenset[int], float]] = {}
+        # RTP timestamp → (tiles the present waits for, monotonic time of
+        # the last tile fed, tiles that arrived), newest last, bounded; and
+        # the newest timestamp fed. A hidden damaged tile leaves the first
+        # set but not the last. Written by the video RX and decode threads;
+        # entries are replaced, never mutated, so the render thread reads
+        # them without a lock.
+        self._fed_by_ts: dict[int, tuple[frozenset[int], float, frozenset[int]]] = {}
         self._newest_fed_ts: Optional[int] = None
         self._lat_samples: list[tuple] = []
         self._lat_last_log = 0.0
@@ -1399,6 +1401,8 @@ class Session:
             enable_quality_gate=True, on_frame_published=self._on_frame_published,
             prefer_hwaccel=_pf,
         )
+        if hasattr(self._decoder, "on_frame_hidden"):
+            self._decoder.on_frame_hidden = self._on_frame_hidden
         if self._decoder is None:
             raise RuntimeError(
                 f"no usable decoder for codec {self._video_codec!r} "
@@ -1940,6 +1944,18 @@ class Session:
                 log.debug("RCTL: %d sent, delay %.1f ms", sent, delay_ms)
 
     # ── decoder publish hook ─────────────────────────────────────────
+
+    def _on_frame_hidden(self, tile_idx: int, rtp_ts: Optional[int]) -> None:
+        """A damaged frame was decoded and hidden (decode worker thread).
+        The decoder is alive, and the frame's present must not wait for
+        this tile: drop it from the frame's fed set, then wake the renderer.
+        No LTR ack: the frame is damaged."""
+        self._last_publish_t = time.monotonic()
+        if rtp_ts is not None:
+            entry = self._fed_by_ts.get(rtp_ts)
+            if entry is not None and tile_idx in entry[0]:
+                self._fed_by_ts[rtp_ts] = (entry[0] - {tile_idx}, entry[1], entry[2])
+        self._fresh_evt.set()
 
     def _on_frame_published(self, tile_idx: int) -> None:
         """Called from a HevcDecoder worker thread after a frame is
@@ -3049,8 +3065,8 @@ class Session:
     def _note_fed(self, rtp_ts: int, ti: int) -> None:
         """Record that tile `ti` was handed a picture stamped `rtp_ts`."""
         fed = self._fed_by_ts
-        tiles = fed.get(rtp_ts, (frozenset(), 0.0))[0]
-        fed[rtp_ts] = (tiles | {ti}, time.monotonic())
+        tiles, _, arrived = fed.get(rtp_ts, (frozenset(), 0.0, frozenset()))
+        fed[rtp_ts] = (tiles | {ti}, time.monotonic(), arrived | {ti})
         newest = self._newest_fed_ts
         if newest is None or _rtp_ts_after(rtp_ts, newest):
             self._newest_fed_ts = rtp_ts
@@ -3073,8 +3089,8 @@ class Session:
         entry = self._fed_by_ts.get(rtp_ts)
         if entry is None:
             return True               # unknown or forgotten: don't wait
-        tiles, last_t = entry
-        if self.num_tiles - 1 in tiles:
+        _, last_t, arrived = entry
+        if self.num_tiles - 1 in arrived:
             return True
         newest = self._newest_fed_ts
         if newest is not None and _rtp_ts_after(newest, rtp_ts):
@@ -4520,7 +4536,7 @@ class Session:
         ltr_dist = getattr(rps, "max_ref_distance", 0)
         ltr_miss = getattr(rps, "missing_ref_events", 0)
         log.debug(
-            "profile: decoder=%s tiles=%s rates=%s clean_rates=%s shown_rates=%s gray_tiles=%s fps corrupt_shown=%s tile_KBs=%s loss/tile=%s "
+            "profile: decoder=%s tiles=%s rates=%s clean_rates=%s shown_rates=%s gray_tiles=%s fps corrupt_shown=%s corrupt_hidden=%s tile_KBs=%s loss/tile=%s "
             "ltr=ack%d/far%d/dist%d/miss%d "
             "loss_total=%d unmapped=%d "
             "ssrc_groups=%d last_publish=%.1fs ago "
@@ -4530,7 +4546,8 @@ class Session:
             "nalu={%s}",
             decoder_name,
             good, rates, clean_rates, shown_rates, sorted(self._decoder.bad_tiles),
-            getattr(self._decoder, "corrupt_shown", "-"), tile_kbs, loss_delta,
+            getattr(self._decoder, "corrupt_shown", "-"),
+            getattr(self._decoder, "corrupt_hidden", "-"), tile_kbs, loss_delta,
             self._ltr_acks_sent, ltr_far, ltr_dist, ltr_miss,
             loss_total, loss_unmapped,
             ssrc_groups,

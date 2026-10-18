@@ -114,7 +114,8 @@ Useful env switches: `ISS_HWACCEL`, `ISS_HW_SLOW_FALLBACK=0`, `ISS_PREFER_CUDA=0
 flow), `ISS_TILES_PER_FRAME`, `ISS_NALU_DUMP=<file>` (record HEVC for offline replay), `ISS_DECODE_DELAY_MS` (simulate a slow
 decoder), `ISS_PRESENT_COALESCE_MS=<ms>` (per-frame present deadline; 0 = present per tile, the old behaviour),
 `ISS_CUDA_DOWNLOAD=default` (PyAV's download of CUDA frames instead of the pinned copy),
-`ISS_FRAME_RECOVERY=0` (HEVC damage/recovery from the old IDR-size rule instead of `is_corrupt` frames).
+`ISS_FRAME_RECOVERY=0` (HEVC damage/recovery from the old IDR-size rule instead of `is_corrupt` frames),
+`ISS_HIDE_DAMAGED=0` (show damaged HEVC frames instead of keeping the tile's last good picture).
 
 ## Tried and dropped (don't retry without a new idea)
 - **Encoder frame rate above 60:** a 120/144 Hz virtual display and the `com.apple.VideoConference` keys
