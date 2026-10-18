@@ -67,8 +67,8 @@ iss = "isharescreen.tui.entry:main"
 isharescreen = "isharescreen.tui.entry:main"
 
 [project.urls]
-Homepage = "https://github.com/renegadelink/iShareScreen"
-Issues = "https://github.com/renegadelink/iShareScreen/issues"
+Homepage = "https://github.com/madmalkav/iShareScreen"
+Issues = "https://github.com/madmalkav/iShareScreen/issues"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

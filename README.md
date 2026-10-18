@@ -21,7 +21,7 @@ available.
    `brew install python`, or `uv python install 3.13`).
 2. Install iShareScreen:
    ```sh
-   pip install git+https://github.com/renegadelink/iShareScreen.git
+   pip install git+https://github.com/madmalkav/iShareScreen.git
    ```
 
 #### Windows
@@ -30,7 +30,7 @@ available.
    (the installer includes pip; check "Add python.exe to PATH" during install).
 2. Open PowerShell or cmd and run:
    ```sh
-   pip install git+https://github.com/renegadelink/iShareScreen.git
+   pip install git+https://github.com/madmalkav/iShareScreen.git
    ```
 
 3. (Optional, only if you want audio) install **libfdk-aac** — Apple's
@@ -74,7 +74,7 @@ available.
 3. Install iShareScreen (in a venv recommended):
    ```sh
    python3 -m venv ~/.venvs/iss
-   ~/.venvs/iss/bin/pip install git+https://github.com/renegadelink/iShareScreen.git
+   ~/.venvs/iss/bin/pip install git+https://github.com/madmalkav/iShareScreen.git
    ~/.venvs/iss/bin/iss     # or symlink to ~/.local/bin
    ```
 
@@ -88,7 +88,7 @@ from source instead:
 sudo apt install pkg-config gcc python3-dev \
     libavformat-dev libavcodec-dev libavdevice-dev libavutil-dev \
     libavfilter-dev libswscale-dev libswresample-dev
-~/.venvs/iss/bin/pip install --no-binary av git+https://github.com/renegadelink/iShareScreen.git
+~/.venvs/iss/bin/pip install --no-binary av git+https://github.com/madmalkav/iShareScreen.git
 ```
 (On an existing install: `~/.venvs/iss/bin/pip install --force-reinstall
 --no-binary av av`.) Arch-based distros ship the FFmpeg headers in the
