@@ -136,6 +136,35 @@ For CI / scripted use:
 echo "$PASSWORD" | iss --headless --host mac.local -u me --password-stdin --auto-quit-secs 30
 ```
 
+### Lower latency on Linux: variable refresh rate (VRR)
+
+On a VRR-capable monitor, let the compositor use VRR for windowed
+applications. The monitor then refreshes when a new frame is ready,
+instead of on a fixed grid, so frames don't wait for the next refresh.
+Measured on KDE Plasma 6.8 (KWin, Wayland, 120 Hz panel) with the
+desktop window: about 8 ms lower median latency and 9 ms lower p95, from
+a frame's arrival to it being on screen (two test scenes, median / 95th
+percentile):
+
+| Setting | Arrival → screen, p50 / p95 |
+|---|---|
+| fixed refresh | 19 / 26 ms |
+| VRR | 11 / 17 ms |
+
+On KDE Plasma, set System Settings → Display & Monitor → your monitor
+→ Adaptive sync to **Always**, or from a terminal (use the output name
+`kscreen-doctor -o` lists):
+
+```sh
+kscreen-doctor output.DP-1.vrrpolicy.always
+```
+
+The default, **Automatic**, uses VRR only for fullscreen windows, so the
+iss window doesn't get it.
+
+The setting is desktop-wide, and some panels flicker at low frame rates
+with VRR. Other compositors weren't tested.
+
 ## Codecs and decoders
 
 The Mac can send the screen in one of two codecs, and iss can decode each one
