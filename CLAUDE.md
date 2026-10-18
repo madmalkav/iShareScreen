@@ -57,8 +57,10 @@ guide is the README's "Codecs and decoders" section.
   moves the target. With RCTL the target sits at ~58 Mbit/s; without it, it stays at ~20.8 (#20). TMMBR and the BWE field
   are ignored.
 - **4 tiles:** Apple's default `tilesPerFrame=4` = 4 horizontal strips = 4 consecutive SSRCs, cross-tile references, DONL in
-  every payload. `tilesPerFrame=1` has no DONL (depacketizer must handle both), makes the host send only ~57.5 fps, and saves no
-  decode CPU. Keep 4.
+  every payload. `tilesPerFrame=1` has no DONL (iss's depacketizers handle only 4-tile DONL streams), makes the host send only
+  ~57.5 fps, and is **~24 ms slower end to end** (Mac render → on screen p50 53 → 78 ms, p95 59 → 85; 4K, live, 3 rounds,
+  2026-10-18): the host encodes a 1-tile frame whole at 60/s (4 strips at 240/s, each sent as done, all 4 within ~8 ms) (+12 ms),
+  and iss decodes and uploads the whole picture after its last packet instead of overlapping strips (+10 ms). Keep 4.
 - **Start:** like Apple's viewer, iss's first (plaintext) `SetEncodings` leaves out 1010 and the second (encrypted, sent
   right after the cipher starts) names it; the Mac sends one message 1 per `SetEncodings` naming 1010, ~0.4–1.7 s later (its
   own delay), and answers an offer only after it. iss waits for message 1, sends **one** offer and reads until message 2
@@ -103,6 +105,11 @@ guide is the README's "Codecs and decoders" section.
     allows ≤10.
 - **Quality:** the post-scroll blur was the ~20 Mbit/s cap; RCTL mostly fixes it. What remains at 58–60 Mbit/s is the encoder's
   limit (smaller `--advertise` = more bits per pixel). H.264 4:2:0 softens coloured text.
+- **Resolution** (live, 4 tiles, CUDA, RTX 2080, 2026-10-18; all held 60 fps): 1x `3840x2160` performs as `1920x1080@2`
+  (same pixels). 1x `3440x1440` is ~5.5 ms faster end to end, and 1x `1920x1080` ~11 ms faster with about half the CPU (S2
+  iss CPU 44 → 26 % of a core; decode 2.0 → 0.9 ms per tile). On a HiDPI desktop (KDE 2x) the window is sized in points, so
+  1x pictures below 4K are upscaled (×1.46, ×1.95) and look soft. Bits per pixel weren't tested (the scenes ran far under
+  the 60 Mbit/s cap).
 
 ## Merged work (fork), for context
 #1–3 honest HW probe/binding · #4 PyAV/VAAPI docs · #5 resize stale-tile crash · #6 overload resync · #7 pipeline 60→95 fps ·
