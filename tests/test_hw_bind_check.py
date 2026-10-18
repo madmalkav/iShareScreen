@@ -21,6 +21,7 @@ def _decoder(hw_name, codec_fmt):
                 types.SimpleNamespace(format=types.SimpleNamespace(name=codec_fmt)))
     d._pts_to_tile = {}
     d._pts_submit_t = {}
+    d._pts_to_ts = {}
     return d
 
 

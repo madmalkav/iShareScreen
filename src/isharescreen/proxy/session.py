@@ -260,6 +260,19 @@ def _disable_udp_connreset(sock: socket.socket) -> None:
         log.debug("SIO_UDP_CONNRESET not disabled: %s", e)
 
 
+# How many recent RTP timestamps `fed_tiles` remembers (~2 s at 60 fps).
+_FED_BY_TS_MAX = 128
+# Apple sends one frame's tiles in index order, ~2.7 ms apart (p99 under
+# 5 ms, replay 2026-10-17). After this long with no further tile of a frame,
+# the sender is done with it, even if the last tile index never came (frames
+# that only update some tiles).
+_FRAME_TILE_GAP_S = 0.005
+
+
+def _rtp_ts_after(a: int, b: int) -> bool:
+    """RTP timestamp `a` is after `b` (32-bit serial-number arithmetic)."""
+    return a != b and ((a - b) & 0xFFFFFFFF) < 0x80000000
+
 # ISS_LAT_TRACE=1: log per-stage picture latency every 5 s (diagnostic).
 _LAT_TRACE = os.environ.get("ISS_LAT_TRACE") == "1"
 
@@ -668,6 +681,12 @@ class Session:
         self._ltr_acks_sent: int = 0
         self._lat_arrival: dict[int, float] = {}
         self._lat_grp: dict[tuple[int, int], list[float]] = {}
+        # RTP timestamp → (tiles handed a picture with it, monotonic time of
+        # the last one), newest last, bounded; and the newest timestamp fed.
+        # Written by the video RX thread; entries are replaced, never
+        # mutated, so the render thread reads them without a lock.
+        self._fed_by_ts: dict[int, tuple[frozenset[int], float]] = {}
+        self._newest_fed_ts: Optional[int] = None
         self._lat_samples: list[tuple] = []
         self._lat_last_log = 0.0
         # The per-ack LTR log fires at frame rate and drowns the debug log
@@ -3022,8 +3041,45 @@ class Session:
         else:
             if _LAT_TRACE:
                 self._lat_push(key, ti)
+            if nalus:
+                self._note_fed(key[1], ti)
             for nalu in nalus:
-                self._decoder.feed_nalu(nalu, ti, donl=donl)
+                self._decoder.feed_nalu(nalu, ti, donl=donl, rtp_ts=key[1])
+
+    def _note_fed(self, rtp_ts: int, ti: int) -> None:
+        """Record that tile `ti` was handed a picture stamped `rtp_ts`."""
+        fed = self._fed_by_ts
+        tiles = fed.get(rtp_ts, (frozenset(), 0.0))[0]
+        fed[rtp_ts] = (tiles | {ti}, time.monotonic())
+        newest = self._newest_fed_ts
+        if newest is None or _rtp_ts_after(rtp_ts, newest):
+            self._newest_fed_ts = rtp_ts
+        if len(fed) > _FED_BY_TS_MAX:
+            fed.pop(next(iter(fed)), None)
+
+    def fed_tiles(self, rtp_ts: int) -> frozenset[int]:
+        """Tiles handed a picture stamped `rtp_ts` so far. Apple stamps every
+        tile of one frame with the same timestamp, so the desktop frontend
+        waits for these before presenting the frame (one present per frame)."""
+        entry = self._fed_by_ts.get(rtp_ts)
+        return entry[0] if entry is not None else frozenset()
+
+    def frame_sent(self, rtp_ts: int) -> bool:
+        """Whether the host is done sending the frame stamped `rtp_ts`:
+        its last tile index arrived (tiles come in index order), a newer
+        frame started, or no further tile came for `_FRAME_TILE_GAP_S`.
+        Until then a tile still in flight would be missed by a present that
+        only waits for `fed_tiles`."""
+        entry = self._fed_by_ts.get(rtp_ts)
+        if entry is None:
+            return True               # unknown or forgotten: don't wait
+        tiles, last_t = entry
+        if self.num_tiles - 1 in tiles:
+            return True
+        newest = self._newest_fed_ts
+        if newest is not None and _rtp_ts_after(newest, rtp_ts):
+            return True
+        return time.monotonic() - last_t >= _FRAME_TILE_GAP_S
 
     def _lat_push(self, key: tuple[int, int], ti: Optional[int]) -> None:
         """ISS_LAT_TRACE: hand the picture's arrival times to the decoder."""

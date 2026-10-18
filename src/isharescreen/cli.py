@@ -272,6 +272,18 @@ def _make_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    g.add_argument(
+        "--present-policy", choices=("frame", "tile"), default="frame",
+        help=(
+            "desktop frontend: when to present. 'frame' (default) presents "
+            "once per frame, when all its tiles are decoded (at most 12 ms "
+            "after the first); 'tile' presents after every decoded tile, the "
+            "old behaviour, which can wait on vsync between the tiles of one "
+            "frame and skip pictures. ISS_PRESENT_COALESCE_MS=<ms> overrides both "
+            "(0 = 'tile')."
+        ),
+    )
+
     g = p.add_argument_group("audio")
     g.add_argument(
         "--audio", action=argparse.BooleanOptionalAction, default=True,
@@ -565,7 +577,8 @@ def _run_frontend(config: SessionConfig, args: argparse.Namespace) -> int:
                                 "'combined') — auto-opening one window per "
                                 "monitor", args.display)
         return run_desktop(config, auto_quit_secs=args.auto_quit_secs,
-                           display=display_idx, display_all=display_all)
+                           display=display_idx, display_all=display_all,
+                           present_policy=getattr(args, "present_policy", "frame"))
     # browser (default): H.264 pass-through needs the AVC codec path. The
     # Session reads ISS_VIDEO_CODEC at construction, so force it unless the
     # user explicitly chose a codec.
