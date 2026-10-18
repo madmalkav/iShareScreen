@@ -4,6 +4,7 @@ Only enabled where verified (CUDA; VAAPI on NVIDIA's driver); every other
 setup must keep today's inline download."""
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
 from isharescreen.proxy.media import hevc
@@ -106,7 +107,8 @@ def test_real_gpu_frames_decode_to_full_444_tiles():
     else:
         pytest.skip("no verified GPU-frames hwaccel here")
     import av
-    ctx = HevcDecoder._gpu_frames_context(hw_type)
+    dec = HevcDecoder(1)
+    ctx = dec._gpu_frames_context(hw_type)
     assert ctx is not None
     frames = list(ctx.decode(av.Packet(hwcaps._HEVC444_SAMPLE))) + list(ctx.decode(None))
     assert frames[0].format.name == hw_type            # stayed on the GPU
@@ -116,3 +118,15 @@ def test_real_gpu_frames_decode_to_full_444_tiles():
     sw = (list(sw_ctx.decode(av.Packet(hwcaps._HEVC444_SAMPLE))) + list(sw_ctx.decode(None)))[0]
     assert (tile.width, tile.chroma_width) == (sw.width, sw.width)   # full 4:4:4
     assert bytes(tile.y) == bytes(sw.planes[0])
+    if hw_type == "cuda":
+        # The pinned download (cuda_download.py) gives the same picture.
+        assert dec._cuda_primary
+        pinned, _ = _av_frame_to_tile(
+            frames[0], [None], set(), rtp_ts=12345,
+            download=lambda f: dec._pinned.download(f, 0))
+        assert dec._pinned.active and pinned.y_stride == sw.width
+        assert pinned.rtp_ts == 12345        # per-frame present needs it
+        for got, ref in zip((pinned.y, pinned.u, pinned.v), sw.planes):
+            ref_rows = np.frombuffer(ref, np.uint8).reshape(-1, ref.line_size)
+            assert bytes(got) == ref_rows[:, :sw.width].tobytes()
+        dec._pinned.close()            # after the last read of its buffers
