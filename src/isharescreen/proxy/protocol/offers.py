@@ -205,10 +205,10 @@ _REMOTE_ENDPOINT_INFO = _build_remote_endpoint_info()
 
 # ── offer construction ───────────────────────────────────────────────
 
-# Audio-description field4 gate values (see the mode-8 branch below for the
-# full RE note). Apple's default 24191 selects the single system-audio tier;
-# a sub-floor value makes the server send no audio, which is how --no-audio
-# turns audio off on the wire.
+# Audio-description field4 values (see the mode-8 branch below). Field 4 is a
+# bitmask of accepted RTP payload types; bit 0x1000 is PT 101, the sound.
+# Apple's 24191 (0x5E7F) has it; 1000 (0x3E8) doesn't, and the host then sends
+# no audio, which is how --no-audio turns audio off on the wire.
 _AUDIO_F4_ON = 24191
 _AUDIO_F4_OFF = 1000
 
@@ -287,19 +287,18 @@ def _build_mediablob(
         )
         desc_field = _field_bytes(5, desc)
     elif mode == 8:
-        # field4 is the viewer's requested audio bitrate — Apple's
-        # `preferredMediaBitRate` (reversed from AVConference). The host parses
-        # it into the negotiated AVCAudioStreamConfig and feeds it to
-        # `VCAudioTierPicker tierForAudioBitrate:`, which selects an AAC-ELD
-        # tier. For screen-share system audio there is effectively ONE tier
-        # (~21 kbps), so any value above its floor gives a flat 21 kbps (Apple's
-        # own client sends 24191); this is NOT a proportional bitrate. But a
-        # value BELOW the tier floor makes the picker find "no corresponding
-        # tier" and the host sends no audio (~0.4 kbps residual). A live sweep
-        # put the floor at ~5 kbps (<=4000 = off, >=6000 = on). This is the only
-        # negotiated audio knob: the audio section is mandatory (omitting it
-        # degenerates negotiation) and screen-share audio has no direction/enable
-        # field, so honoring --no-audio means requesting a sub-floor bitrate.
+        # field4 is a bitmask of the RTP payload types the viewer accepts
+        # (remotex's reading, confirmed live): bit 0x1000 = PT 101, the
+        # screen-sharing sound, which the host sends at its own fixed rate
+        # (AAC-ELD 48 kHz stereo, ~320 kbit/s) whatever field4 says. 4096
+        # (0x1000 alone) streams sound; 16384 (0x4000) makes the host refuse
+        # the offer; 1000 (no 0x1000) is accepted with no audio (~0.4 kbps
+        # residual). It is NOT a bitrate (an earlier reading: a tier selector
+        # with a ~5 kbps floor; the sweep behind it, <=4000 off / >=6000 on,
+        # fits the bitmask too). This is the only negotiated audio knob: the
+        # audio section is mandatory (omitting it degenerates negotiation) and
+        # screen-share audio has no direction/enable field, so honoring
+        # --no-audio means leaving out bit 0x1000.
         # ISS_AUDIO_F4 overrides for testing.
         _default_f4 = _AUDIO_F4_ON if audio_enabled else _AUDIO_F4_OFF
         _af4 = int(_os.environ.get("ISS_AUDIO_F4", str(_default_f4)))

@@ -87,6 +87,10 @@ guide is the README's "Codecs and decoders" section.
 - **Curtain mode** (default) gives the virtual display at the requested size and locks the host's local screen while the session
   runs; the host stays locked after the session ends. `--no-curtain` shares the physical display (e.g. native 5120×2160).
   The host may switch the session to its physical display on a local login/idle (see open topics).
+- **Audio** (fixed by the host): AAC-ELD, 48 kHz stereo, 480 samples = 10 ms per packet, ~320 kbit/s while sound plays
+  (4-byte units in silence). The offer's audio field 4 is a **bitmask of accepted payload types** (bit `0x1000` = PT 101), not
+  a bitrate: `4096` streams sound, `16384` is refused, `--no-audio` sends `1000`. Apple's decoder config signals SBR, but the
+  stream carries none (rfc §10.3, §10.4).
 - **Decoders:**
   - NVIDIA: CUDA is preferred over VAAPI when the VA driver is NVIDIA's (#11). HW frames stay on the GPU and are downloaded
     lazily (#9).
