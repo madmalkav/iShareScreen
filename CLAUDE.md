@@ -90,7 +90,8 @@ guide is the README's "Codecs and decoders" section.
 - **Audio** (fixed by the host): AAC-ELD, 48 kHz stereo, 480 samples = 10 ms per packet, ~320 kbit/s while sound plays
   (4-byte units in silence). The offer's audio field 4 is a **bitmask of accepted payload types** (bit `0x1000` = PT 101), not
   a bitrate: `4096` streams sound, `16384` is refused, `--no-audio` sends `1000`. Apple's decoder config signals SBR, but the
-  stream carries none (rfc §10.3, §10.4).
+  stream carries none (rfc §10.3, §10.4), so libfdk-aac (Linux/Windows) is configured without it (`f8e65000`): same samples,
+  0.67 ms sooner. Verified on Linux; **Windows not tested yet**. macOS (AudioToolbox) keeps Apple's config.
 - **Decoders:**
   - NVIDIA: CUDA is preferred over VAAPI when the VA driver is NVIDIA's (#11). HW frames stay on the GPU and are downloaded
     lazily (#9).
@@ -120,6 +121,7 @@ decoder), `ISS_PRESENT_COALESCE_MS=<ms>` (per-frame present deadline; 0 = presen
 `ISS_CUDA_DOWNLOAD=default` (PyAV's download of CUDA frames instead of the pinned copy),
 `ISS_FRAME_RECOVERY=0` (HEVC damage/recovery from the old IDR-size rule instead of `is_corrupt` frames),
 `ISS_HIDE_DAMAGED=0` (show damaged HEVC frames instead of keeping the tile's last good picture).
+`ISS_AAC_SBR_CONFIG=1` (configure libfdk-aac with Apple's SBR AudioSpecificConfig, the old behaviour).
 
 ## Tried and dropped (don't retry without a new idea)
 - **Encoder frame rate above 60:** a 120/144 Hz virtual display and the `com.apple.VideoConference` keys

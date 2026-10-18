@@ -57,17 +57,25 @@ SAMPLES_PER_FRAME = 480              # AAC-ELD frame size: 10 ms at 48 kHz
 #   audioObjectTypeExt     6 bits = 0b000111 (+32 → AOT 39 = AAC-ELD)
 #   samplingFrequencyIndex 4 bits = 0b0011   (=3, 48 kHz)
 #   channelConfiguration   4 bits = 0b0010   (=2, stereo)
-#   GASpecificConfig:
-#     frameLengthFlag        1 bit = 0b1     (480-sample short frame)
-#     dependsOnCoreCoder     1 bit = 0b0
-#     extensionFlag          1 bit = 0b0
 #   ELDSpecificConfig:
+#     frameLengthFlag        1 bit = 0b1     (480-sample frame)
+#     aacSection/Scalefactor/SpectralDataResilienceFlag  3 bits = 0b000
 #     ldSbrPresentFlag       1 bit = 0b1     (SBR signalled; the stream carries none)
-#     ldSbrSamplingRate      1 bit = 0b0
+#     ldSbrSamplingRate      1 bit = 0b0     (single-rate)
 #     ldSbrCrcFlag           1 bit = 0b0
+#     ld_sbr_header          16 bits
 #     eldExtType             4 bits = 0b0000 (ELDEXT_TERM)
 #   trailing zero pad to byte boundary
 AUDIO_SPECIFIC_CONFIG = bytes.fromhex("f8e65132e000")
+
+# What libfdk-aac is configured with: the same AAC-ELD 48 kHz stereo
+# 480-sample config with ldSbrPresentFlag 0 (0xf8e65000). The units carry no
+# SBR data, so it decodes the same samples as the SBR config above, 32
+# samples (0.67 ms) sooner. ISS_AAC_SBR_CONFIG=1 restores Apple's config;
+# it is also the fallback if a libfdk build refuses this one.
+FDK_AUDIO_SPECIFIC_CONFIG = (
+    AUDIO_SPECIFIC_CONFIG if os.environ.get("ISS_AAC_SBR_CONFIG", "0") == "1"
+    else bytes.fromhex("f8e65000"))
 
 # AudioToolbox `kAudioFormatProperty_MagicCookie` value Apple's
 # screensharingd emits — the full 43-byte MPEG-4 ES_Descriptor wrapping
@@ -333,17 +341,23 @@ class _LibFdkBackend:
         if not self._handle:
             raise RuntimeError("aacDecoder_Open returned NULL")
 
-        # Configure with the AAC-ELD-SBR AudioSpecificConfig.
-        asc_buf = (ctypes.c_ubyte * len(AUDIO_SPECIFIC_CONFIG)).from_buffer_copy(AUDIO_SPECIFIC_CONFIG)
-        asc_ptr = (ctypes.POINTER(ctypes.c_ubyte) * 1)(
-            ctypes.cast(asc_buf, ctypes.POINTER(ctypes.c_ubyte))
-        )
-        asc_len = (ctypes.c_uint * 1)(len(AUDIO_SPECIFIC_CONFIG))
-        err = self._lib.aacDecoder_ConfigRaw(self._handle, asc_ptr, asc_len)
+        # Configure with the no-SBR AudioSpecificConfig (see
+        # FDK_AUDIO_SPECIFIC_CONFIG); fall back to Apple's SBR one.
+        for asc in dict.fromkeys((FDK_AUDIO_SPECIFIC_CONFIG, AUDIO_SPECIFIC_CONFIG)):
+            asc_buf = (ctypes.c_ubyte * len(asc)).from_buffer_copy(asc)
+            asc_ptr = (ctypes.POINTER(ctypes.c_ubyte) * 1)(
+                ctypes.cast(asc_buf, ctypes.POINTER(ctypes.c_ubyte))
+            )
+            asc_len = (ctypes.c_uint * 1)(len(asc))
+            err = self._lib.aacDecoder_ConfigRaw(self._handle, asc_ptr, asc_len)
+            if err == _FDK_OK:
+                break
+            log.debug("libfdk: config %s refused (0x%04x)", asc.hex(), err)
         if err != _FDK_OK:
             self._lib.aacDecoder_Close(self._handle)
             self._handle = None
             raise RuntimeError(f"aacDecoder_ConfigRaw failed: 0x{err:04x}")
+        log.info("libfdk: AAC-ELD config %s", asc.hex())
 
         self._asc_keep = asc_buf  # keep alive for decoder's lifetime
         self._output_buf = (ctypes.c_int16 * _FDK_OUT_MAX_SAMPLES)()
