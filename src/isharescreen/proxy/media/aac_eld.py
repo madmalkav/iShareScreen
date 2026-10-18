@@ -1,4 +1,4 @@
-"""AAC-ELD-SBR 48 kHz stereo decoder for Apple's PT=101 audio.
+"""AAC-ELD 48 kHz stereo decoder for Apple's PT=101 audio.
 
 Two backends, picked by platform:
 
@@ -10,18 +10,20 @@ Two backends, picked by platform:
     `dnf install fdk-aac` (Fedora), or
     `libfdk-aac-2.dll` on Windows.
 
-We deliberately don't fall back to PyAV. libavcodec 62 has **no native
-AAC-ELD decoder** (`aac` / `aac_fixed` / `aac_latm` all return
-`PatchWelcomeError` when AOT-39 extradata is supplied), and standard
-PyAV PyPI wheels don't ship `libfdk_aac` for licensing reasons. The only
-PyAV codec that handles AAC-ELD-SBR is `aac_at`, which is just
+We don't fall back to PyAV. An earlier libavcodec 62 build returned
+`PatchWelcomeError` for AOT-39 extradata, and standard PyAV PyPI wheels
+don't ship `libfdk_aac` for licensing reasons. (FFmpeg's native `aac` in
+libavcodec 63 does decode this stream, identically to libfdk, given the
+no-SBR config `f8e65000`; not wired up here.) `aac_at` is just
 AudioToolbox in a wrapper — strictly worse than calling AudioToolbox
 ourselves.
 
-Apple's PT=101 wire format is one raw AAC-ELD-SBR access unit per RTP
+Apple's PT=101 wire format is one raw AAC-ELD access unit per RTP
 packet. No RFC 3640 AU-headers, no RED framing. Silence AUs are 4
-bytes of zeros. 480 frames per packet, which under SBR maps to 20 ms
-of perceived audio.
+bytes of zeros. 480 frames per packet = 10 ms at 48 kHz (100 packets/s,
+RTP timestamp step 480). Apple's config below signals single-rate
+low-delay SBR, but the units carry no SBR data: decoding with SBR off
+gives the same samples 32 samples (0.67 ms) earlier.
 
 Both backends return `(N, 2)` float32 stereo at 48 kHz, or `None` on
 decode failure / first-call priming where the decoder has nothing to
@@ -47,7 +49,7 @@ log = logging.getLogger(__name__)
 
 OUTPUT_SAMPLE_RATE = 48_000
 OUTPUT_CHANNELS = 2
-SAMPLES_PER_FRAME = 480              # AAC-ELD frame size at 48 kHz / 20 ms
+SAMPLES_PER_FRAME = 480              # AAC-ELD frame size: 10 ms at 48 kHz
 
 # AudioSpecificConfig per ISO/IEC 14496-3 §1.6.2.1.
 # Bit layout of the 48-bit value 0xf8e65132e000:
@@ -60,7 +62,7 @@ SAMPLES_PER_FRAME = 480              # AAC-ELD frame size at 48 kHz / 20 ms
 #     dependsOnCoreCoder     1 bit = 0b0
 #     extensionFlag          1 bit = 0b0
 #   ELDSpecificConfig:
-#     ldSbrPresentFlag       1 bit = 0b1     (SBR enabled)
+#     ldSbrPresentFlag       1 bit = 0b1     (SBR signalled; the stream carries none)
 #     ldSbrSamplingRate      1 bit = 0b0
 #     ldSbrCrcFlag           1 bit = 0b0
 #     eldExtType             4 bits = 0b0000 (ELDEXT_TERM)
