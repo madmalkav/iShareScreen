@@ -123,7 +123,10 @@ guide is the README's "Codecs and decoders" section.
 #23 RTCP demux · #24 1×1 resize request · #25 RTCP liveness · #26/#28/#34/#38/#42/#43 docs · #29 control-message record split ·
 #30 one offer per message 1 + re-offer on wake · #31 `--max-bitrate` · #32 `--refresh-rate` · #33 800×600-point minimum ·
 #35 Windows UDP CONNRESET · #36 no NACKs/retransmit wait · #37 return to virtual display (layout flags) · #39 `ISS_LAT_TRACE` ·
-#40 faster connect · #41 precise scroll `0x17`. Closed unmerged: #27 (AVC backlog guard for slow viewers; `--max-bitrate` covers it,
+#40 faster connect · #41 precise scroll `0x17` · #44 virtual-display return retries · #45 no Python inside `av_log` ·
+#46 present once per frame (`--present-policy`) · #47 CUDA pinned download · #48 HEVC damage/recovery from `is_corrupt` ·
+#49 hide damaged HEVC frames · #50/#51/#52/#54/#55/#56 docs · #53 libfdk-aac without SBR · #57 fast HEVC keyframe retry.
+Closed unmerged: #27 (AVC backlog guard for slow viewers; `--max-bitrate` covers it,
   branch `fix/avc-backlog-guard` kept).
 
 Useful env switches: `ISS_HWACCEL`, `ISS_HW_SLOW_FALLBACK=0`, `ISS_PREFER_CUDA=0`, `ISS_HW_FRAMES_ON_GPU`, `ISS_RCTL=0`,
