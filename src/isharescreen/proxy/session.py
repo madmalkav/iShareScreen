@@ -1403,6 +1403,11 @@ class Session:
         )
         if hasattr(self._decoder, "on_frame_hidden"):
             self._decoder.on_frame_hidden = self._on_frame_hidden
+        gate = getattr(self._decoder, "_gate", None)
+        if getattr(gate, "fast", False):
+            # Send a keyframe request as soon as one is needed, not on the
+            # next 500 ms tick (see FrameQualityGate.fast_retry).
+            gate.on_keyframe_needed = self._tx_wakeup.set
         if self._decoder is None:
             raise RuntimeError(
                 f"no usable decoder for codec {self._video_codec!r} "
@@ -4325,7 +4330,18 @@ class Session:
                     self._log_profile_snapshot()
             except Exception as e:
                 log.debug("tx loop tick error: %s", e)
-            self._tx_wakeup.wait(_TX_INTERVAL_S)
+            self._tx_wakeup.wait(self._tx_wait_s())
+
+    def _tx_wait_s(self) -> float:
+        """Until the next tx tick: _TX_INTERVAL_S, or sooner when the quality
+        gate in fast mode has a keyframe retry due."""
+        gate = getattr(self._decoder, "_gate", None)
+        if not getattr(gate, "fast", False):
+            return _TX_INTERVAL_S
+        due = gate.next_fir_due()
+        if due is None:
+            return _TX_INTERVAL_S
+        return min(_TX_INTERVAL_S, max(0.005, due - time.monotonic()))
 
     def _audio_rtcp_rates(self, elapsed: float) -> dict:
         """Split the rtcp-muxed 'ctrl' socket into its real components: the

@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 from .tiles import TileFrame  # noqa: F401  (kept for type-annotation parity)
 
@@ -123,6 +123,12 @@ class FrameQualityGate:
     # the lossy WiFi that triggers this and make loss worse. This is a
     # mitigation, NOT a cure; the wedge is fundamentally undetectable here.
     _RECOVERY_QUIET_S: float = 1.50
+    # Fast mode (`fast_retry`): re-request pace while a tile still waits for
+    # its keyframe, the post-IDR grace, and fast attempts before the slow
+    # cadence (~3 s, as the old 8 x 1 s was ~8 s).
+    _FAST_RE_ARM_S: float = 0.10
+    _FAST_POST_IDR_GRACE_S: float = 0.10
+    _FAST_RE_ARM_CAP: int = 30
 
     def __init__(
         self,
@@ -206,6 +212,42 @@ class FrameQualityGate:
         # which is correct (VT's silent gray was never quiet-window-
         # detectable in the first place).
         self._last_unreliable_concealment_t: float = 0.0
+        # Fast keyframe retry (see `fast_retry`); off by default.
+        self.fast = False
+        # Called (no arguments, from the decode thread) when a tile newly
+        # needs a keyframe in fast mode, so the session can send the FIR now
+        # rather than on its next 500 ms tick.
+        self.on_keyframe_needed: Optional[Callable[[], None]] = None
+
+    def fast_retry(self) -> None:
+        """Retry keyframe requests at the host's real pace. Measured on the
+        Mac (packet captures, 2026-10-19): it answers a FIR with a full
+        keyframe (IDR on tile 0 + intra on the rest) in 8-30 ms, the
+        keyframe arrives within ~20 ms, and it discards a request only when
+        it comes under ~50 ms after its previous keyframe. So while a tile
+        waits for its keyframe, re-request every `_FAST_RE_ARM_S` instead
+        of every second; once one arrived and the tile only waits for a
+        clean frame, fall back to the old 1 s pace (no storm). A loss
+        after the keyframe re-arms the fast pace. The post-IDR grace drops
+        to `_FAST_POST_IDR_GRACE_S`: with frame-level damage detection
+        (`is_corrupt`) a damaged frame after a keyframe is real damage, not
+        drain noise. For decoders that flag damage per frame only."""
+        self.fast = True
+        self._POST_IDR_GRACE_S = self._FAST_POST_IDR_GRACE_S
+        self._RE_ARM_CAP = self._FAST_RE_ARM_CAP
+
+    def next_fir_due(self) -> Optional[float]:
+        """Monotonic time the next FIR may go out, or None if none is needed."""
+        if not self._keyframe_required:
+            return None
+        return self._fir_last_t[0] + self._re_arm_interval()
+
+    def _re_arm_interval(self) -> float:
+        if self._fir_attempts[0] >= self._RE_ARM_CAP:
+            return self._RE_ARM_SLOW_INTERVAL_S
+        if self.fast and not self._keyframe_required <= self._idr_observed:
+            return self._FAST_RE_ARM_S
+        return self._RE_ARM_INTERVAL_S
 
     # -- main "publish" hook --------------------------------------------
     # Always publishes. Kept as a callable for API compatibility with
@@ -264,9 +306,18 @@ class FrameQualityGate:
         state = self._states[tile_idx]
         state.bad_streak += 1
         state.needs_real_frame = True
+        if (self.fast and tile_idx in self._keyframe_required
+                and tile_idx in self._idr_observed):
+            # Damage after the keyframe (and past the grace): that keyframe
+            # didn't cover it; ask for another at the fast pace.
+            self._idr_observed.discard(tile_idx)
+            if self.on_keyframe_needed is not None:
+                self.on_keyframe_needed()
         if tile_idx not in self._keyframe_required:
             self._keyframe_required.add(tile_idx)
             self._idr_observed.discard(tile_idx)
+            if self.fast and self.on_keyframe_needed is not None:
+                self.on_keyframe_needed()
             self._fir_attempts[tile_idx] = 0
             self._cap_warned[tile_idx] = False
             self.flicker_events += 1
@@ -412,8 +463,7 @@ class FrameQualityGate:
         # clears (no manual force-IDR needed). `mark_clean` resets `_fir_attempts` on
         # recovery, dropping us back to the fast cadence.
         capped = self._fir_attempts[0] >= self._RE_ARM_CAP
-        interval = (self._RE_ARM_SLOW_INTERVAL_S if capped
-                    else self._RE_ARM_INTERVAL_S)
+        interval = self._re_arm_interval()
         if now - self._fir_last_t[0] < interval:
             return set()
         self._fir_last_t[0] = now

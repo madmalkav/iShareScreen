@@ -81,6 +81,10 @@ guide is the README's "Codecs and decoders" section.
   the 1 s least gap on 1-tile streams. The host has **retransmission off** (`vcMediaStreamIsRTXEnabled = 0`): iss's NACKs
   are ignored and loss is repaired only by keyframes (5 % random loss ≈ half the shown frames, 42 gray-outs in 45 s). The
   host derives loss from RCTL's running packet count (`Uplink PLR` matches), and loss doesn't move its target.
+  From packet captures (2026-10-19): a FIR for any tile brings a full keyframe (IDR on tile 0 + intra on the others) in
+  8–30 ms, all 4 strips within ~20 ms; the host discards only requests under ~50 ms after its previous keyframe. So HEVC
+  (libav, frame recovery) re-requests every 100 ms while a tile waits for its keyframe, right away instead of on the
+  500 ms tx tick, and only 1 s apart once it came (`FrameQualityGate.fast_retry`).
 - **Refresh:** the host accepts any virtual-display refresh in the `0x1d` mode (30/60/90/120), but its **encoder frame rate stays
   60** (`vcMediaStreamFramerate = 60`). 30 Hz halves the pictures and decode cost (`--refresh-rate 30`: software
   HEVC 4K 319 % → 183 % of a core; kept across resizes); >60 gives nothing.
@@ -128,7 +132,8 @@ flow), `ISS_TILES_PER_FRAME`, `ISS_NALU_DUMP=<file>` (record HEVC for offline re
 decoder), `ISS_PRESENT_COALESCE_MS=<ms>` (per-frame present deadline; 0 = present per tile, the old behaviour),
 `ISS_CUDA_DOWNLOAD=default` (PyAV's download of CUDA frames instead of the pinned copy),
 `ISS_FRAME_RECOVERY=0` (HEVC damage/recovery from the old IDR-size rule instead of `is_corrupt` frames),
-`ISS_HIDE_DAMAGED=0` (show damaged HEVC frames instead of keeping the tile's last good picture).
+`ISS_HIDE_DAMAGED=0` (show damaged HEVC frames instead of keeping the tile's last good picture),
+`ISS_FAST_KEYFRAME=0` (HEVC: the old 1 s keyframe retry, 0.5 s post-IDR grace and 500 ms FIR tick).
 `ISS_AAC_SBR_CONFIG=1` (configure libfdk-aac with Apple's SBR AudioSpecificConfig, the old behaviour).
 
 ## Tried and dropped (don't retry without a new idea)
