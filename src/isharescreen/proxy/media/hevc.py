@@ -146,6 +146,11 @@ _HEVC_CODEC_FLAGS = _CODEC_FLAG_LOW_DELAY | (
 # showing visibly broken pictures. Needs _FRAME_RECOVERY (the flag is the
 # signal). ISS_HIDE_DAMAGED=0: show them, as before.
 _HIDE_DAMAGED = _FRAME_RECOVERY and os.environ.get("ISS_HIDE_DAMAGED", "1") != "0"
+# Re-request keyframes at the host's real pace while a tile waits for one
+# (FrameQualityGate.fast_retry). Needs _FRAME_RECOVERY: per-frame damage is
+# what tells real damage after a keyframe from drain noise.
+# ISS_FAST_KEYFRAME=0: the old 1 s retry and 0.5 s post-IDR grace.
+_FAST_KEYFRAME = _FRAME_RECOVERY and os.environ.get("ISS_FAST_KEYFRAME", "1") != "0"
 
 
 def _loaded_va_driver(maps_path: str = "/proc/self/maps") -> Optional[str]:
@@ -295,6 +300,8 @@ class HevcDecoder:
         self.on_frame_hidden = None
         self._cuda_primary = False
         self._gate = FrameQualityGate(num_tiles, enabled=enable_quality_gate)
+        if _FAST_KEYFRAME:
+            self._gate.fast_retry()
         self._tiles: list[_TileSlot] = [_TileSlot() for _ in range(num_tiles)]
         # Per-tile cumulative NALU-type histogram. nal_unit_type is the
         # HEVC 6-bit field at byte0>>1 & 0x3F. Surfaced in the session
